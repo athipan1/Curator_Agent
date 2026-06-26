@@ -24,6 +24,11 @@ class SkillCreateRequest(BaseModel):
     source_agent: Optional[str] = Field(default=None, max_length=120)
 
 
+class SkillLifecycleRequest(BaseModel):
+    reason: Optional[str] = Field(default=None, max_length=1000)
+    approved_by: Optional[str] = Field(default=None, max_length=120)
+
+
 class SkillRecord(BaseModel):
     skill_id: str
     name: str
@@ -35,7 +40,9 @@ class SkillRecord(BaseModel):
     output_schema: Dict[str, Any]
     source_agent: Optional[str] = None
     validation_status: str
+    approval_status: str
     validation_errors: List[str]
+    lifecycle_notes: List[str] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
 
