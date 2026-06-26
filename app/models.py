@@ -42,7 +42,7 @@ class SkillRecord(BaseModel):
     validation_status: str
     approval_status: str
     validation_errors: List[str]
-    lifecycle_notes: List[str] = Field(default_factory=list)
+    lifecycle_notes: List[Dict[str, Any]] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
 
