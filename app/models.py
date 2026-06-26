@@ -1,0 +1,50 @@
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, Field
+
+
+class StandardResponse(BaseModel):
+    status: str = "success"
+    agent_type: str = "curator-agent"
+    version: str = "0.1.0"
+    data: Any
+
+
+class SkillCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+    description: str = Field(..., min_length=1, max_length=2000)
+    code: str = Field(..., min_length=1)
+    tags: List[str] = Field(default_factory=list)
+    market_context: Dict[str, Any] = Field(default_factory=dict)
+    input_schema: Dict[str, Any] = Field(default_factory=dict)
+    output_schema: Dict[str, Any] = Field(default_factory=dict)
+    source_agent: Optional[str] = Field(default=None, max_length=120)
+
+
+class SkillRecord(BaseModel):
+    skill_id: str
+    name: str
+    description: str
+    code_hash: str
+    tags: List[str]
+    market_context: Dict[str, Any]
+    input_schema: Dict[str, Any]
+    output_schema: Dict[str, Any]
+    source_agent: Optional[str] = None
+    validation_status: str
+    validation_errors: List[str]
+    created_at: datetime
+    updated_at: datetime
+
+
+class SkillDetail(SkillRecord):
+    code: str
+
+
+class SkillValidationResult(BaseModel):
+    approved: bool
+    errors: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
