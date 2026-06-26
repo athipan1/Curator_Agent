@@ -2,7 +2,7 @@
 
 Curator Agent is a safe registry service for reusable trading-analysis skills in the multi-agent trading system.
 
-The MVP is intentionally conservative: it can store, validate, and approve candidate Python skills, but it does **not** execute stored code. This keeps the first version safe for a trading stack while still creating the foundation for skill curation, retrieval, audit, and later sandboxed execution.
+The first phase stores, validates, and approves candidate Python skills. The current MVP also adds a conservative sandbox execution endpoint for **approved signal-only skills**. Curator does not place broker orders and does not expose broker credentials to stored code.
 
 ## Why this exists
 
@@ -25,7 +25,7 @@ Human/Risk owner
         ↓ approves safe, reviewed skills
 Manager Agent / Orchestrator
         ↓ retrieves approved skills by market context
-Safe Sandbox Runner, future phase
+Safe Sandbox Runner
         ↓ emits signal only, never places orders directly
 Risk Agent → Execution Agent → Broker
 ```
@@ -40,6 +40,7 @@ GET  /skills/search?q=...&approval_status=...
 GET  /skills/{skill_id}
 POST /skills/{skill_id}/approve
 POST /skills/{skill_id}/deprecate
+POST /skills/{skill_id}/execute
 ```
 
 ## Skill lifecycle
@@ -53,12 +54,12 @@ Validation and approval are separate:
 - `validation_status=validated` means the static safety validator passed.
 - `validation_status=rejected` means the skill failed static safety validation.
 - `approval_status=draft` means the skill is stored but not production-approved.
-- `approval_status=approved` means the skill has been reviewed and can be retrieved by production agents.
+- `approval_status=approved` means the skill has been reviewed and can be retrieved/executed by production agents.
 - `approval_status=deprecated` means the skill should no longer be selected for new use.
 
-Only `validated` skills can be approved.
+Only `validated` skills can be approved. Only `validated + approved` skills can execute.
 
-## Safety rules in MVP
+## Safety rules
 
 The static validator rejects obvious unsafe Python constructs:
 
@@ -70,6 +71,26 @@ The static validator rejects obvious unsafe Python constructs:
 - code with no function definition
 
 Rejected skills are still stored with `validation_status="rejected"` so they can be audited.
+
+The execution sandbox is intentionally narrow:
+
+- runs in a short-lived restricted process
+- no broker credentials are injected
+- no network clients are injected
+- no file IO helpers are available
+- timeout is capped between `0.1` and `5.0` seconds
+- skill output must be a JSON object
+- broker/order-like output keys such as `order_id`, `broker_order_id`, and `risk_approval_id` are rejected
+
+Curator should emit **signals only**, for example:
+
+```json
+{
+  "signal": "buy",
+  "confidence": 0.7,
+  "reason": "RSI oversold"
+}
+```
 
 ## Run locally
 
@@ -115,10 +136,41 @@ curl -X POST http://localhost:8010/skills/<skill_id>/approve \
   -d '{"approved_by": "risk-owner", "reason": "Reviewed for paper-trading use"}'
 ```
 
+## Example sandbox execution
+
+```bash
+curl -X POST http://localhost:8010/skills/<skill_id>/execute \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "inputs": {"rsi_value": 25},
+    "timeout_seconds": 1.0
+  }'
+```
+
+Expected response shape:
+
+```json
+{
+  "status": "success",
+  "agent_type": "curator-agent",
+  "version": "0.1.0",
+  "data": {
+    "execution_status": "success",
+    "output": {"signal": "buy", "confidence": 0.7},
+    "safety": {
+      "broker_access": false,
+      "network_access": false,
+      "file_access": false,
+      "order_placement": false
+    }
+  }
+}
+```
+
 ## Next phases
 
 1. Add semantic skill search.
 2. Add signed skill versions.
-3. Add isolated Docker sandbox execution with no broker credentials and signal-only output.
+3. Move sandbox execution into a fully isolated Docker runtime profile.
 4. Add Manager_Agent integration to query approved skills by market context.
 5. Add Skill performance tracking after backtests and paper-trade observation.
