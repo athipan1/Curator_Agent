@@ -7,10 +7,21 @@ from app.registry import SkillRegistry
 VALID_SKILL = """
 def bollinger_rsi_signal(close_values, rsi_value):
     if rsi_value < 30:
-        return {"signal": "buy", "confidence": 0.7}
+        return {"signal": "buy", "confidence": 0.7, "reason": "RSI oversold"}
     if rsi_value > 70:
-        return {"signal": "sell", "confidence": 0.7}
-    return {"signal": "hold", "confidence": 0.5}
+        return {"signal": "sell", "confidence": 0.7, "reason": "RSI overbought"}
+    return {"signal": "hold", "confidence": 0.5, "reason": "Neutral RSI"}
+"""
+
+TIMEOUT_SKILL = """
+def never_finishes():
+    while True:
+        pass
+"""
+
+FORBIDDEN_OUTPUT_SKILL = """
+def leaks_order_id():
+    return {"signal": "buy", "confidence": 0.8, "order_id": "should-not-leak"}
 """
 
 
@@ -24,7 +35,7 @@ def _register_valid_skill(client: TestClient) -> dict:
             "tags": ["technical", "rsi"],
             "market_context": {"asset_class": "stocks", "regime": "mean_reversion"},
             "input_schema": {"close_values": "list[float]", "rsi_value": "float"},
-            "output_schema": {"signal": "str", "confidence": "float"},
+            "output_schema": {"signal": "str", "confidence": "float", "reason": "str"},
             "source_agent": "Technical_Agent",
         },
     )
@@ -135,3 +146,88 @@ def test_list_and_search_skills(tmp_path):
     searched = client.get("/skills/search?q=momentum&approval_status=approved")
     assert searched.status_code == 200
     assert searched.json()["data"][0]["name"] == "RSI Momentum Filter"
+
+
+def test_execute_approved_skill_returns_signal_only(tmp_path):
+    registry = SkillRegistry(str(tmp_path / "skills.sqlite3"))
+    client = TestClient(create_app(registry))
+    payload = _register_valid_skill(client)
+    client.post(f"/skills/{payload['skill_id']}/approve", json={})
+
+    executed = client.post(
+        f"/skills/{payload['skill_id']}/execute",
+        json={"inputs": {"close_values": [1, 2, 3], "rsi_value": 25}},
+    )
+
+    assert executed.status_code == 200
+    data = executed.json()["data"]
+    assert data["execution_status"] == "success"
+    assert data["output"]["signal"] == "buy"
+    assert data["output"]["confidence"] == 0.7
+    assert data["safety"] == {
+        "broker_access": False,
+        "network_access": False,
+        "file_access": False,
+        "order_placement": False,
+    }
+
+
+def test_execute_requires_approval(tmp_path):
+    registry = SkillRegistry(str(tmp_path / "skills.sqlite3"))
+    client = TestClient(create_app(registry))
+    payload = _register_valid_skill(client)
+
+    executed = client.post(
+        f"/skills/{payload['skill_id']}/execute",
+        json={"inputs": {"close_values": [1, 2, 3], "rsi_value": 25}},
+    )
+
+    assert executed.status_code == 400
+    assert executed.json()["detail"] == "only_approved_skills_can_execute"
+
+
+def test_execute_times_out_long_running_skill(tmp_path):
+    registry = SkillRegistry(str(tmp_path / "skills.sqlite3"))
+    client = TestClient(create_app(registry))
+    response = client.post(
+        "/skills/register",
+        json={
+            "name": "Never Finishes",
+            "description": "Used to verify process timeout handling.",
+            "code": TIMEOUT_SKILL,
+        },
+    )
+    payload = response.json()["data"]
+    client.post(f"/skills/{payload['skill_id']}/approve", json={})
+
+    executed = client.post(
+        f"/skills/{payload['skill_id']}/execute",
+        json={"inputs": {}, "timeout_seconds": 0.1},
+    )
+
+    assert executed.status_code == 200
+    data = executed.json()["data"]
+    assert data["execution_status"] == "timeout"
+    assert "skill_execution_timeout" in data["error"]
+
+
+def test_execute_rejects_broker_like_output_keys(tmp_path):
+    registry = SkillRegistry(str(tmp_path / "skills.sqlite3"))
+    client = TestClient(create_app(registry))
+    response = client.post(
+        "/skills/register",
+        json={
+            "name": "Forbidden Output",
+            "description": "Used to verify signal-only output enforcement.",
+            "code": FORBIDDEN_OUTPUT_SKILL,
+        },
+    )
+    payload = response.json()["data"]
+    client.post(f"/skills/{payload['skill_id']}/approve", json={})
+
+    executed = client.post(f"/skills/{payload['skill_id']}/execute", json={"inputs": {}})
+
+    assert executed.status_code == 200
+    data = executed.json()["data"]
+    assert data["execution_status"] == "failed"
+    assert "forbidden_output_keys" in data["error"]

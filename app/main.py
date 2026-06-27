@@ -5,19 +5,29 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
 
-from app.models import SkillCreateRequest, SkillLifecycleRequest, StandardResponse
-from app.registry import SkillRegistry
+from app.executor import SafeSkillExecutor
+from app.models import (
+    SkillCreateRequest,
+    SkillExecuteRequest,
+    SkillLifecycleRequest,
+    StandardResponse,
+)
+from app.registry import APPROVAL_APPROVED, SkillRegistry
 
 
 DEFAULT_DB_PATH = os.getenv("CURATOR_DB_PATH", "./curator_skills.sqlite3")
 
 
-def create_app(registry: SkillRegistry | None = None) -> FastAPI:
+def create_app(
+    registry: SkillRegistry | None = None,
+    executor: SafeSkillExecutor | None = None,
+) -> FastAPI:
     skill_registry = registry or SkillRegistry(DEFAULT_DB_PATH)
+    skill_executor = executor or SafeSkillExecutor()
     app = FastAPI(
         title="Curator Agent",
         version="0.1.0",
-        description="Safe registry for reusable trading analysis skills. MVP stores and validates skills but does not execute them.",
+        description="Safe registry and sandbox runner for reusable trading analysis skills.",
     )
 
     @app.get("/health", response_model=StandardResponse)
@@ -26,7 +36,8 @@ def create_app(registry: SkillRegistry | None = None) -> FastAPI:
             data={
                 "status": "healthy",
                 "storage": "sqlite",
-                "execution_enabled": False,
+                "execution_enabled": True,
+                "execution_mode": "restricted_process_signal_only",
             }
         )
 
@@ -81,6 +92,27 @@ def create_app(registry: SkillRegistry | None = None) -> FastAPI:
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="skill_not_found") from exc
         return StandardResponse(data=record.model_dump(mode="json"))
+
+    @app.post("/skills/{skill_id}/execute", response_model=StandardResponse)
+    async def execute_skill(skill_id: str, request: SkillExecuteRequest) -> StandardResponse:
+        try:
+            record = skill_registry.get(skill_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="skill_not_found") from exc
+
+        if record.validation_status != "validated":
+            raise HTTPException(status_code=400, detail="only_validated_skills_can_execute")
+        if record.approval_status != APPROVAL_APPROVED:
+            raise HTTPException(status_code=400, detail="only_approved_skills_can_execute")
+
+        result = skill_executor.execute(
+            skill_id=record.skill_id,
+            code=record.code,
+            inputs=request.inputs,
+            function_name=request.function_name,
+            timeout_seconds=request.timeout_seconds,
+        )
+        return StandardResponse(data=result)
 
     @app.get("/skills/{skill_id}", response_model=StandardResponse)
     async def get_skill(skill_id: str) -> StandardResponse:

@@ -29,6 +29,12 @@ class SkillLifecycleRequest(BaseModel):
     approved_by: Optional[str] = Field(default=None, max_length=120)
 
 
+class SkillExecuteRequest(BaseModel):
+    inputs: Dict[str, Any] = Field(default_factory=dict)
+    function_name: Optional[str] = Field(default=None, max_length=120)
+    timeout_seconds: float = Field(default=1.0, ge=0.1, le=5.0)
+
+
 class SkillRecord(BaseModel):
     skill_id: str
     name: str
