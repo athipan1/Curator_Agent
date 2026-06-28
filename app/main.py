@@ -7,11 +7,13 @@ from fastapi import FastAPI, HTTPException, Query
 
 from app.executor import SafeSkillExecutor
 from app.models import (
+    PerformancePolicyCurationRequest,
     SkillCreateRequest,
     SkillExecuteRequest,
     SkillLifecycleRequest,
     StandardResponse,
 )
+from app.performance_policy import curate_performance_policy
 from app.registry import APPROVAL_APPROVED, SkillRegistry
 
 
@@ -26,7 +28,7 @@ def create_app(
     skill_executor = executor or SafeSkillExecutor()
     app = FastAPI(
         title="Curator Agent",
-        version="0.1.0",
+        version="0.2.0",
         description="Safe registry and sandbox runner for reusable trading analysis skills.",
     )
 
@@ -40,6 +42,11 @@ def create_app(
                 "execution_mode": "restricted_process_signal_only",
             }
         )
+
+    @app.post("/curate/performance-policy", response_model=StandardResponse)
+    async def curate_performance_policy_endpoint(request: PerformancePolicyCurationRequest) -> StandardResponse:
+        result = curate_performance_policy(request)
+        return StandardResponse(data=result.model_dump(mode="json"))
 
     @app.post("/skills/register", response_model=StandardResponse)
     async def register_skill(request: SkillCreateRequest) -> StandardResponse:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -61,3 +61,58 @@ class SkillValidationResult(BaseModel):
     approved: bool
     errors: List[str] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)
+
+
+class LearningPolicyDeltas(BaseModel):
+    strategy_bucket_weights: Dict[str, float] = Field(default_factory=dict)
+    asset_biases: Dict[str, float] = Field(default_factory=dict)
+    risk: Dict[str, float] = Field(default_factory=dict)
+    guardrails: Dict[str, Any] = Field(default_factory=dict)
+
+
+class PerformanceLearningResult(BaseModel):
+    learning_state: str = "success"
+    learning_mode: str = "performance_summary_review"
+    confidence_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    reviewed_closed_plans: int = Field(default=0, ge=0)
+    performance_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    bucket_metrics: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    symbol_metrics: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    policy_deltas: LearningPolicyDeltas = Field(default_factory=LearningPolicyDeltas)
+    reasoning: List[str] = Field(default_factory=list)
+
+
+class PerformancePolicyCurationRequest(BaseModel):
+    account_id: str | int
+    learning_result: PerformanceLearningResult
+    current_policy: Optional[Dict[str, Any]] = None
+    min_confidence_to_apply: float = Field(default=0.70, ge=0.0, le=1.0)
+    pause_threshold: float = Field(default=-0.10, ge=-1.0, le=0.0)
+
+
+class CuratedPolicyAction(BaseModel):
+    target_type: Literal["strategy_bucket", "symbol", "risk", "guardrail"]
+    target: str
+    action: Literal[
+        "increase_weight",
+        "decrease_weight",
+        "pause_strategy_bucket",
+        "increase_bias",
+        "decrease_bias",
+        "reduce_risk",
+        "require_human_review",
+        "keep_observing",
+    ]
+    delta: Optional[float] = None
+    auto_apply: bool = False
+    priority: Literal["low", "medium", "high"] = "medium"
+    reason: str
+
+
+class PerformancePolicyCurationResponse(BaseModel):
+    curation_state: Literal["approved_for_review", "review_required", "observation_only", "rejected"]
+    action_count: int = 0
+    actions: List[CuratedPolicyAction] = Field(default_factory=list)
+    rejected_actions: List[CuratedPolicyAction] = Field(default_factory=list)
+    reasoning: List[str] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
