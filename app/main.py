@@ -20,6 +20,7 @@ from app.models import (
 from app.performance_policy import curate_performance_policy
 from app.recommendations import recommend_skills
 from app.registry import APPROVAL_APPROVED, SkillRegistry
+from app.seed_skills import seed_default_backtest_skill
 from app.system_contract import (
     CURATOR_AGENT_TYPE,
     CURATOR_AGENT_VERSION,
@@ -30,6 +31,13 @@ from app.system_contract import (
 
 
 DEFAULT_DB_PATH = os.getenv("CURATOR_DB_PATH", "./curator_skills.sqlite3")
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _backtest_status_from_database(skill_id: str, database_client: DatabaseAgentClient) -> SkillBacktestStatusResponse:
@@ -60,6 +68,9 @@ def create_app(
     skill_registry = registry or SkillRegistry(DEFAULT_DB_PATH)
     skill_executor = executor or SafeSkillExecutor()
     skill_database_client = database_client or DatabaseAgentClient()
+    seeded_skill: Dict[str, Any] | None = None
+    if _bool_env("CURATOR_SEED_BACKTEST_SKILL", True):
+        seeded_skill = seed_default_backtest_skill(skill_registry)
     app = FastAPI(
         title="Curator Agent",
         version=CURATOR_SERVICE_VERSION,
@@ -92,6 +103,7 @@ def create_app(
                 "execution_enabled": True,
                 "database_telemetry_enabled": skill_database_client.enabled,
                 "database_backtest_status_enabled": skill_database_client.enabled,
+                "seeded_backtest_skill_id": (seeded_skill or {}).get("skill_id"),
                 "performance_policy_endpoint": "/curate/performance-policy",
                 "skill_register_endpoint": "/skills/register",
                 "skill_list_endpoint": "/skills",
@@ -117,6 +129,7 @@ def create_app(
                 "execution_mode": "restricted_process_signal_only",
                 "database_telemetry_enabled": skill_database_client.enabled,
                 "database_backtest_status_enabled": skill_database_client.enabled,
+                "seeded_backtest_skill_id": (seeded_skill or {}).get("skill_id"),
             }
         )
 

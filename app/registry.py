@@ -78,7 +78,7 @@ class SkillRegistry:
 
     def register(self, request: SkillCreateRequest) -> SkillDetail:
         validation = self.validator.validate(request.code)
-        skill_id = str(uuid.uuid4())
+        skill_id = request.skill_id or str(uuid.uuid4())
         now = _utc_now().isoformat()
         code_hash = hashlib.sha256(request.code.encode("utf-8")).hexdigest()
         validation_status = "validated" if validation.approved else "rejected"
@@ -86,6 +86,9 @@ class SkillRegistry:
         validation_errors = validation.errors + [f"warning: {item}" for item in validation.warnings]
 
         with self._connect() as conn:
+            existing = conn.execute("SELECT skill_id FROM skills WHERE skill_id = ?", (skill_id,)).fetchone()
+            if existing is not None:
+                return self.get(skill_id)
             conn.execute(
                 """
                 INSERT INTO skills (

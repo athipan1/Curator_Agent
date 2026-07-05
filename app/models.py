@@ -14,6 +14,7 @@ class StandardResponse(BaseModel):
 
 
 class SkillCreateRequest(BaseModel):
+    skill_id: Optional[str] = Field(default=None, min_length=1, max_length=120)
     name: str = Field(..., min_length=1, max_length=120)
     description: str = Field(..., min_length=1, max_length=2000)
     code: str = Field(..., min_length=1)
