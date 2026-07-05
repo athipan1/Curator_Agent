@@ -33,6 +33,42 @@ class SkillExecuteRequest(BaseModel):
     inputs: Dict[str, Any] = Field(default_factory=dict)
     function_name: Optional[str] = Field(default=None, max_length=120)
     timeout_seconds: float = Field(default=1.0, ge=0.1, le=5.0)
+    account_id: str | int = 1
+    symbol: Optional[str] = Field(default=None, max_length=20)
+    strategy_bucket: Optional[str] = Field(default=None, max_length=120)
+    market_regime: Optional[str] = Field(default=None, max_length=120)
+    run_id: Optional[str] = Field(default=None, max_length=120)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class SkillRecommendationRequest(BaseModel):
+    account_id: str | int = 1
+    symbol: Optional[str] = Field(default=None, max_length=20)
+    asset_class: str = "us_equity"
+    market_regime: Optional[str] = Field(default=None, max_length=120)
+    strategy_bucket: Optional[str] = Field(default=None, max_length=120)
+    timeframe: Optional[str] = Field(default=None, max_length=30)
+    top_k: int = Field(default=3, ge=1, le=20)
+    tags: List[str] = Field(default_factory=list)
+
+
+class RecommendedSkill(BaseModel):
+    skill_id: str
+    name: str
+    score: float = Field(default=0.0, ge=0.0, le=1.0)
+    approval_status: str
+    validation_status: str
+    reason: str
+    performance: Dict[str, Any] = Field(default_factory=dict)
+    tags: List[str] = Field(default_factory=list)
+    market_context: Dict[str, Any] = Field(default_factory=dict)
+
+
+class SkillRecommendationResponse(BaseModel):
+    recommendation_state: Literal["ranked", "fallback_no_database", "no_approved_skills"]
+    recommended_skills: List[RecommendedSkill] = Field(default_factory=list)
+    rejected_count: int = 0
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class SkillRecord(BaseModel):
