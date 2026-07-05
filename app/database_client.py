@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Dict, Optional
 
@@ -10,9 +11,10 @@ from typing import Any, Dict, Optional
 class DatabaseAgentClient:
     """Small stdlib HTTP client for optional Database_Agent telemetry.
 
-    Curator must remain signal-only. This client only records execution telemetry
-    and reads advisory skill rankings; failures are non-fatal so Curator can keep
-    serving approved skills when Database_Agent is unavailable.
+    Curator must remain signal-only. This client only records execution telemetry,
+    reads advisory skill rankings, and reads backtest status. Failures are
+    non-fatal so Curator can keep serving approved skills when Database_Agent is
+    unavailable, except for explicit backtest-gated approval paths.
     """
 
     def __init__(
@@ -60,14 +62,24 @@ class DatabaseAgentClient:
     def create_skill_execution_log(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         return self._request("POST", "/skills/execution-logs", payload)
 
-    def rank_skills(self, *, account_id: str | int = 1, symbol: Optional[str] = None,
-                    strategy_bucket: Optional[str] = None, market_regime: Optional[str] = None,
-                    limit: int = 20) -> Dict[str, Any]:
-        query = [f"account_id={account_id}", f"limit={limit}"]
+    def rank_skills(
+        self,
+        *,
+        account_id: str | int = 1,
+        symbol: Optional[str] = None,
+        strategy_bucket: Optional[str] = None,
+        market_regime: Optional[str] = None,
+        limit: int = 20,
+    ) -> Dict[str, Any]:
+        query = [f"account_id={urllib.parse.quote(str(account_id))}", f"limit={limit}"]
         if symbol:
-            query.append(f"symbol={symbol.upper()}")
+            query.append(f"symbol={urllib.parse.quote(symbol.upper())}")
         if strategy_bucket:
-            query.append(f"strategy_bucket={strategy_bucket}")
+            query.append(f"strategy_bucket={urllib.parse.quote(strategy_bucket)}")
         if market_regime:
-            query.append(f"market_regime={market_regime}")
+            query.append(f"market_regime={urllib.parse.quote(market_regime)}")
         return self._request("GET", f"/skills/performance/rank?{'&'.join(query)}")
+
+    def get_skill_backtest_status(self, skill_id: str) -> Dict[str, Any]:
+        safe_skill_id = urllib.parse.quote(skill_id, safe="")
+        return self._request("GET", f"/skills/{safe_skill_id}/backtest-status")
