@@ -5,15 +5,18 @@ from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 
+from app.database_client import DatabaseAgentClient
 from app.executor import SafeSkillExecutor
 from app.models import (
     PerformancePolicyCurationRequest,
     SkillCreateRequest,
     SkillExecuteRequest,
     SkillLifecycleRequest,
+    SkillRecommendationRequest,
     StandardResponse,
 )
 from app.performance_policy import curate_performance_policy
+from app.recommendations import recommend_skills
 from app.registry import APPROVAL_APPROVED, SkillRegistry
 from app.system_contract import (
     CURATOR_AGENT_TYPE,
@@ -30,9 +33,11 @@ DEFAULT_DB_PATH = os.getenv("CURATOR_DB_PATH", "./curator_skills.sqlite3")
 def create_app(
     registry: SkillRegistry | None = None,
     executor: SafeSkillExecutor | None = None,
+    database_client: DatabaseAgentClient | None = None,
 ) -> FastAPI:
     skill_registry = registry or SkillRegistry(DEFAULT_DB_PATH)
     skill_executor = executor or SafeSkillExecutor()
+    skill_database_client = database_client or DatabaseAgentClient()
     app = FastAPI(
         title="Curator Agent",
         version=CURATOR_SERVICE_VERSION,
@@ -63,10 +68,12 @@ def create_app(
                 "ready": True,
                 "storage": "sqlite",
                 "execution_enabled": True,
+                "database_telemetry_enabled": skill_database_client.enabled,
                 "performance_policy_endpoint": "/curate/performance-policy",
                 "skill_register_endpoint": "/skills/register",
                 "skill_list_endpoint": "/skills",
                 "skill_search_endpoint": "/skills/search",
+                "skill_recommend_endpoint": "/skills/recommend",
                 "skill_execute_endpoint": "/skills/{skill_id}/execute",
             },
             metadata={
@@ -83,6 +90,7 @@ def create_app(
                 "storage": "sqlite",
                 "execution_enabled": True,
                 "execution_mode": "restricted_process_signal_only",
+                "database_telemetry_enabled": skill_database_client.enabled,
             }
         )
 
@@ -118,6 +126,15 @@ def create_app(
     ) -> StandardResponse:
         records = skill_registry.search(q, approval_status=approval_status)
         return StandardResponse(data=[record.model_dump(mode="json") for record in records])
+
+    @app.post("/skills/recommend", response_model=StandardResponse)
+    async def recommend_skills_endpoint(request: SkillRecommendationRequest) -> StandardResponse:
+        result = recommend_skills(
+            registry=skill_registry,
+            database_client=skill_database_client,
+            request=request,
+        )
+        return StandardResponse(data=result.model_dump(mode="json"))
 
     @app.post("/skills/{skill_id}/approve", response_model=StandardResponse)
     async def approve_skill(
@@ -170,6 +187,41 @@ def create_app(
             function_name=request.function_name,
             timeout_seconds=request.timeout_seconds,
         )
+        output = result.get("output") if isinstance(result, dict) else {}
+        output = output if isinstance(output, dict) else {}
+        telemetry_payload = {
+            "account_id": request.account_id,
+            "skill_id": record.skill_id,
+            "skill_name": record.name,
+            "symbol": request.symbol,
+            "strategy_bucket": request.strategy_bucket,
+            "market_regime": request.market_regime,
+            "signal": output.get("signal"),
+            "confidence": output.get("confidence"),
+            "reason": output.get("reason"),
+            "input_payload": request.inputs,
+            "output_payload": output,
+            "execution_status": result.get("execution_status", "unknown"),
+            "error": result.get("error"),
+            "elapsed_ms": result.get("elapsed_ms"),
+            "source_agent": "curator-agent",
+            "run_id": request.run_id,
+            "metadata": {
+                **request.metadata,
+                "function_name": result.get("function_name"),
+                "code_hash": record.code_hash,
+                "advisory_only": True,
+            },
+        }
+        telemetry_result = skill_database_client.create_skill_execution_log(telemetry_payload)
+        result["database_telemetry"] = {
+            "status": telemetry_result.get("status"),
+            "enabled": skill_database_client.enabled,
+            "execution_log_id": (telemetry_result.get("data") or {}).get("execution_log_id")
+            if isinstance(telemetry_result.get("data"), dict)
+            else None,
+            "error": telemetry_result.get("error"),
+        }
         return StandardResponse(data=result)
 
     @app.get("/skills/{skill_id}", response_model=StandardResponse)
