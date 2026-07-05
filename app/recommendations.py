@@ -35,6 +35,16 @@ def _performance_by_skill(rank_response: Dict[str, Any]) -> Dict[str, Dict[str, 
     return result
 
 
+def _backtest_data(status_response: Dict[str, Any]) -> Dict[str, Any]:
+    data = status_response.get("data") if isinstance(status_response, dict) else None
+    return data if isinstance(data, dict) else {}
+
+
+def _backtest_passed(status_response: Dict[str, Any]) -> bool:
+    data = _backtest_data(status_response)
+    return bool(data.get("passed"))
+
+
 def _fallback_score(skill: SkillRecord, request: SkillRecommendationRequest) -> float:
     score = 0.50
     if request.tags and {tag.lower() for tag in request.tags}.intersection({tag.lower() for tag in skill.tags}):
@@ -77,15 +87,31 @@ def recommend_skills(
     database_rank_available = bool(performance_lookup)
 
     recommendations: List[RecommendedSkill] = []
+    rejected_for_backtest = 0
+    backtest_status_by_skill: Dict[str, Dict[str, Any]] = {}
     for skill in approved_skills:
+        backtest_response = database_client.get_skill_backtest_status(skill.skill_id)
+        backtest_status = _backtest_data(backtest_response)
+        backtest_status_by_skill[skill.skill_id] = backtest_status
+        if request.require_backtest_passed and not _backtest_passed(backtest_response):
+            rejected_for_backtest += 1
+            continue
+
         performance = performance_lookup.get(skill.skill_id, {})
         score = float(performance.get("skill_score") or _fallback_score(skill, request))
+        if backtest_status.get("passed"):
+            score = min(1.0, score + 0.05)
         if performance:
             reason = "Ranked by Database_Agent skill performance history."
         elif database_client.enabled:
             reason = "Approved skill with no matching performance history yet; using context fallback score."
         else:
             reason = "Database_Agent not configured; using approved-skill context fallback score."
+        if backtest_status.get("passed"):
+            reason = f"{reason} Backtest passed."
+        elif request.require_backtest_passed:
+            reason = f"{reason} Backtest gate required."
+
         recommendations.append(
             RecommendedSkill(
                 skill_id=skill.skill_id,
@@ -95,9 +121,25 @@ def recommend_skills(
                 validation_status=skill.validation_status,
                 reason=reason,
                 performance=performance,
+                backtest_status=backtest_status,
                 tags=skill.tags,
                 market_context=skill.market_context,
             )
+        )
+
+    if request.require_backtest_passed and not recommendations:
+        return SkillRecommendationResponse(
+            recommendation_state="no_backtest_passed_skills",
+            recommended_skills=[],
+            rejected_count=rejected_for_backtest,
+            metadata={
+                "database_client_enabled": database_client.enabled,
+                "database_rank_status": rank_response.get("status") if isinstance(rank_response, dict) else None,
+                "require_backtest_passed": True,
+                "backtest_status_by_skill": backtest_status_by_skill,
+                "advisory_only": True,
+                "risk_gate_required": True,
+            },
         )
 
     recommendations.sort(key=lambda item: item.score, reverse=True)
@@ -105,10 +147,12 @@ def recommend_skills(
     return SkillRecommendationResponse(
         recommendation_state="ranked" if database_rank_available else "fallback_no_database",
         recommended_skills=selected,
-        rejected_count=max(0, len(recommendations) - len(selected)),
+        rejected_count=max(0, len(recommendations) - len(selected)) + rejected_for_backtest,
         metadata={
             "database_client_enabled": database_client.enabled,
             "database_rank_status": rank_response.get("status") if isinstance(rank_response, dict) else None,
+            "require_backtest_passed": request.require_backtest_passed,
+            "rejected_for_backtest": rejected_for_backtest,
             "advisory_only": True,
             "risk_gate_required": True,
         },

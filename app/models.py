@@ -29,6 +29,26 @@ class SkillLifecycleRequest(BaseModel):
     approved_by: Optional[str] = Field(default=None, max_length=120)
 
 
+class SkillBacktestApprovalRequest(SkillLifecycleRequest):
+    require_backtest_passed: bool = True
+    allow_missing_database: bool = False
+
+
+class SkillBacktestStatusResponse(BaseModel):
+    skill_id: str
+    database_status: str
+    passed: bool = False
+    status: str = "unknown"
+    latest_run_id: Optional[str] = None
+    latest_score: Optional[float] = None
+    latest_profit_factor: Optional[float] = None
+    latest_win_rate: Optional[float] = None
+    latest_max_drawdown: Optional[float] = None
+    total_runs: int = 0
+    reasons: List[str] = Field(default_factory=list)
+    raw_response: Dict[str, Any] = Field(default_factory=dict)
+
+
 class SkillExecuteRequest(BaseModel):
     inputs: Dict[str, Any] = Field(default_factory=dict)
     function_name: Optional[str] = Field(default=None, max_length=120)
@@ -50,6 +70,7 @@ class SkillRecommendationRequest(BaseModel):
     timeframe: Optional[str] = Field(default=None, max_length=30)
     top_k: int = Field(default=3, ge=1, le=20)
     tags: List[str] = Field(default_factory=list)
+    require_backtest_passed: bool = False
 
 
 class RecommendedSkill(BaseModel):
@@ -60,12 +81,13 @@ class RecommendedSkill(BaseModel):
     validation_status: str
     reason: str
     performance: Dict[str, Any] = Field(default_factory=dict)
+    backtest_status: Dict[str, Any] = Field(default_factory=dict)
     tags: List[str] = Field(default_factory=list)
     market_context: Dict[str, Any] = Field(default_factory=dict)
 
 
 class SkillRecommendationResponse(BaseModel):
-    recommendation_state: Literal["ranked", "fallback_no_database", "no_approved_skills"]
+    recommendation_state: Literal["ranked", "fallback_no_database", "no_approved_skills", "no_backtest_passed_skills"]
     recommended_skills: List[RecommendedSkill] = Field(default_factory=list)
     rejected_count: int = 0
     metadata: Dict[str, Any] = Field(default_factory=dict)

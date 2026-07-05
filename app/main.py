@@ -9,6 +9,8 @@ from app.database_client import DatabaseAgentClient
 from app.executor import SafeSkillExecutor
 from app.models import (
     PerformancePolicyCurationRequest,
+    SkillBacktestApprovalRequest,
+    SkillBacktestStatusResponse,
     SkillCreateRequest,
     SkillExecuteRequest,
     SkillLifecycleRequest,
@@ -28,6 +30,26 @@ from app.system_contract import (
 
 
 DEFAULT_DB_PATH = os.getenv("CURATOR_DB_PATH", "./curator_skills.sqlite3")
+
+
+def _backtest_status_from_database(skill_id: str, database_client: DatabaseAgentClient) -> SkillBacktestStatusResponse:
+    response = database_client.get_skill_backtest_status(skill_id)
+    data = response.get("data") if isinstance(response, dict) else None
+    data = data if isinstance(data, dict) else {}
+    return SkillBacktestStatusResponse(
+        skill_id=skill_id,
+        database_status=str(response.get("status", "unknown")) if isinstance(response, dict) else "unknown",
+        passed=bool(data.get("passed")),
+        status=str(data.get("status", "unknown")),
+        latest_run_id=data.get("latest_run_id"),
+        latest_score=data.get("latest_score"),
+        latest_profit_factor=data.get("latest_profit_factor"),
+        latest_win_rate=data.get("latest_win_rate"),
+        latest_max_drawdown=data.get("latest_max_drawdown"),
+        total_runs=int(data.get("total_runs") or 0),
+        reasons=data.get("reasons") if isinstance(data.get("reasons"), list) else [],
+        raw_response=response if isinstance(response, dict) else {},
+    )
 
 
 def create_app(
@@ -69,11 +91,14 @@ def create_app(
                 "storage": "sqlite",
                 "execution_enabled": True,
                 "database_telemetry_enabled": skill_database_client.enabled,
+                "database_backtest_status_enabled": skill_database_client.enabled,
                 "performance_policy_endpoint": "/curate/performance-policy",
                 "skill_register_endpoint": "/skills/register",
                 "skill_list_endpoint": "/skills",
                 "skill_search_endpoint": "/skills/search",
                 "skill_recommend_endpoint": "/skills/recommend",
+                "skill_backtest_status_endpoint": "/skills/{skill_id}/backtest-status",
+                "skill_approve_from_backtest_endpoint": "/skills/{skill_id}/approve-from-backtest",
                 "skill_execute_endpoint": "/skills/{skill_id}/execute",
             },
             metadata={
@@ -91,6 +116,7 @@ def create_app(
                 "execution_enabled": True,
                 "execution_mode": "restricted_process_signal_only",
                 "database_telemetry_enabled": skill_database_client.enabled,
+                "database_backtest_status_enabled": skill_database_client.enabled,
             }
         )
 
@@ -152,6 +178,53 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return StandardResponse(data=record.model_dump(mode="json"))
+
+    @app.get("/skills/{skill_id}/backtest-status", response_model=StandardResponse)
+    async def skill_backtest_status(skill_id: str) -> StandardResponse:
+        try:
+            skill_registry.get(skill_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="skill_not_found") from exc
+        status = _backtest_status_from_database(skill_id, skill_database_client)
+        return StandardResponse(data=status.model_dump(mode="json"))
+
+    @app.post("/skills/{skill_id}/approve-from-backtest", response_model=StandardResponse)
+    async def approve_skill_from_backtest(
+        skill_id: str,
+        request: SkillBacktestApprovalRequest,
+    ) -> StandardResponse:
+        try:
+            skill_registry.get(skill_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="skill_not_found") from exc
+
+        status = _backtest_status_from_database(skill_id, skill_database_client)
+        if request.require_backtest_passed and not status.passed:
+            if request.allow_missing_database and status.database_status == "skipped":
+                pass
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "skill_backtest_not_passed",
+                        "backtest_status": status.model_dump(mode="json"),
+                    },
+                )
+        try:
+            record = skill_registry.approve(
+                skill_id,
+                approved_by=request.approved_by,
+                reason=request.reason or f"backtest_status={status.status}; latest_run_id={status.latest_run_id}",
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return StandardResponse(
+            data={
+                "skill": record.model_dump(mode="json"),
+                "backtest_status": status.model_dump(mode="json"),
+                "advisory_only": True,
+            }
+        )
 
     @app.post("/skills/{skill_id}/deprecate", response_model=StandardResponse)
     async def deprecate_skill(
