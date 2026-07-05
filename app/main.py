@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 
@@ -15,6 +15,13 @@ from app.models import (
 )
 from app.performance_policy import curate_performance_policy
 from app.registry import APPROVAL_APPROVED, SkillRegistry
+from app.system_contract import (
+    CURATOR_AGENT_TYPE,
+    CURATOR_AGENT_VERSION,
+    CURATOR_SERVICE_VERSION,
+    SCHEMA_VERSION,
+    contract_response,
+)
 
 
 DEFAULT_DB_PATH = os.getenv("CURATOR_DB_PATH", "./curator_skills.sqlite3")
@@ -28,9 +35,45 @@ def create_app(
     skill_executor = executor or SafeSkillExecutor()
     app = FastAPI(
         title="Curator Agent",
-        version="0.2.0",
+        version=CURATOR_SERVICE_VERSION,
         description="Safe registry and sandbox runner for reusable trading analysis skills.",
     )
+
+    @app.get("/version")
+    async def version() -> Dict[str, Any]:
+        return contract_response(
+            status="success",
+            data={
+                "agent_type": CURATOR_AGENT_TYPE,
+                "version": CURATOR_AGENT_VERSION,
+                "service_version": CURATOR_SERVICE_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "api_contract": "multi-agent-trading-api-contract",
+            },
+            metadata={
+                "required_operational_endpoints": ["/health", "/ready", "/version"],
+            },
+        )
+
+    @app.get("/ready")
+    async def ready() -> Dict[str, Any]:
+        return contract_response(
+            status="success",
+            data={
+                "ready": True,
+                "storage": "sqlite",
+                "execution_enabled": True,
+                "performance_policy_endpoint": "/curate/performance-policy",
+                "skill_register_endpoint": "/skills/register",
+                "skill_list_endpoint": "/skills",
+                "skill_search_endpoint": "/skills/search",
+                "skill_execute_endpoint": "/skills/{skill_id}/execute",
+            },
+            metadata={
+                "contract_source": "curator-agent-runtime-contract",
+            },
+            confidence_score=1.0,
+        )
 
     @app.get("/health", response_model=StandardResponse)
     async def health() -> StandardResponse:
@@ -44,7 +87,9 @@ def create_app(
         )
 
     @app.post("/curate/performance-policy", response_model=StandardResponse)
-    async def curate_performance_policy_endpoint(request: PerformancePolicyCurationRequest) -> StandardResponse:
+    async def curate_performance_policy_endpoint(
+        request: PerformancePolicyCurationRequest,
+    ) -> StandardResponse:
         result = curate_performance_policy(request)
         return StandardResponse(data=result.model_dump(mode="json"))
 
@@ -75,7 +120,10 @@ def create_app(
         return StandardResponse(data=[record.model_dump(mode="json") for record in records])
 
     @app.post("/skills/{skill_id}/approve", response_model=StandardResponse)
-    async def approve_skill(skill_id: str, request: SkillLifecycleRequest) -> StandardResponse:
+    async def approve_skill(
+        skill_id: str,
+        request: SkillLifecycleRequest,
+    ) -> StandardResponse:
         try:
             record = skill_registry.approve(
                 skill_id,
@@ -89,7 +137,10 @@ def create_app(
         return StandardResponse(data=record.model_dump(mode="json"))
 
     @app.post("/skills/{skill_id}/deprecate", response_model=StandardResponse)
-    async def deprecate_skill(skill_id: str, request: SkillLifecycleRequest) -> StandardResponse:
+    async def deprecate_skill(
+        skill_id: str,
+        request: SkillLifecycleRequest,
+    ) -> StandardResponse:
         try:
             record = skill_registry.deprecate(
                 skill_id,
