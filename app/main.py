@@ -40,6 +40,18 @@ def _bool_env(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _correlation_id_from_execute_request(request: SkillExecuteRequest) -> Optional[str]:
+    """Resolve the trace id Curator should forward to Database_Agent."""
+    for value in (
+        request.metadata.get("correlation_id"),
+        request.metadata.get("trace_id"),
+        request.run_id,
+    ):
+        if value is not None and value != "":
+            return str(value)
+    return None
+
+
 def _backtest_status_from_database(skill_id: str, database_client: DatabaseAgentClient) -> SkillBacktestStatusResponse:
     response = database_client.get_skill_backtest_status(skill_id)
     data = response.get("data") if isinstance(response, dict) else None
@@ -68,6 +80,7 @@ def create_app(
     skill_registry = registry or SkillRegistry(DEFAULT_DB_PATH)
     skill_executor = executor or SafeSkillExecutor()
     skill_database_client = database_client or DatabaseAgentClient()
+    require_database_telemetry = _bool_env("CURATOR_REQUIRE_DATABASE_TELEMETRY", False)
     seeded_skill: Dict[str, Any] | None = None
     if _bool_env("CURATOR_SEED_BACKTEST_SKILL", True):
         seeded_skill = seed_default_backtest_skill(skill_registry)
@@ -102,6 +115,7 @@ def create_app(
                 "storage": "sqlite",
                 "execution_enabled": True,
                 "database_telemetry_enabled": skill_database_client.enabled,
+                "database_telemetry_required": require_database_telemetry,
                 "database_backtest_status_enabled": skill_database_client.enabled,
                 "seeded_backtest_skill_id": (seeded_skill or {}).get("skill_id"),
                 "performance_policy_endpoint": "/curate/performance-policy",
@@ -128,6 +142,7 @@ def create_app(
                 "execution_enabled": True,
                 "execution_mode": "restricted_process_signal_only",
                 "database_telemetry_enabled": skill_database_client.enabled,
+                "database_telemetry_required": require_database_telemetry,
                 "database_backtest_status_enabled": skill_database_client.enabled,
                 "seeded_backtest_skill_id": (seeded_skill or {}).get("skill_id"),
             }
@@ -275,6 +290,15 @@ def create_app(
         )
         output = result.get("output") if isinstance(result, dict) else {}
         output = output if isinstance(output, dict) else {}
+        correlation_id = _correlation_id_from_execute_request(request)
+        telemetry_metadata = {
+            **request.metadata,
+            "function_name": result.get("function_name"),
+            "code_hash": record.code_hash,
+            "advisory_only": True,
+        }
+        if correlation_id:
+            telemetry_metadata["correlation_id"] = correlation_id
         telemetry_payload = {
             "account_id": request.account_id,
             "skill_id": record.skill_id,
@@ -292,22 +316,30 @@ def create_app(
             "elapsed_ms": result.get("elapsed_ms"),
             "source_agent": "curator-agent",
             "run_id": request.run_id,
-            "metadata": {
-                **request.metadata,
-                "function_name": result.get("function_name"),
-                "code_hash": record.code_hash,
-                "advisory_only": True,
-            },
+            "metadata": telemetry_metadata,
         }
-        telemetry_result = skill_database_client.create_skill_execution_log(telemetry_payload)
+        telemetry_result = skill_database_client.create_skill_execution_log(
+            telemetry_payload,
+            correlation_id=correlation_id,
+        )
         result["database_telemetry"] = {
             "status": telemetry_result.get("status"),
             "enabled": skill_database_client.enabled,
+            "required": require_database_telemetry,
+            "correlation_id": correlation_id,
             "execution_log_id": (telemetry_result.get("data") or {}).get("execution_log_id")
             if isinstance(telemetry_result.get("data"), dict)
             else None,
             "error": telemetry_result.get("error"),
         }
+        if require_database_telemetry and telemetry_result.get("status") != "success":
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "database_telemetry_required_but_failed",
+                    "database_telemetry": result["database_telemetry"],
+                },
+            )
         return StandardResponse(data=result)
 
     @app.get("/skills/{skill_id}", response_model=StandardResponse)
