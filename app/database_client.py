@@ -32,16 +32,27 @@ class DatabaseAgentClient:
     def enabled(self) -> bool:
         return bool(self.base_url)
 
-    def _request(self, method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        payload: Optional[Dict[str, Any]] = None,
+        *,
+        correlation_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         if not self.enabled:
             return {"status": "skipped", "reason": "database_agent_url_not_configured"}
 
         body = None if payload is None else json.dumps(payload, default=str).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if correlation_id:
+            headers["X-Correlation-ID"] = correlation_id
+
         request = urllib.request.Request(
             f"{self.base_url}{path}",
             data=body,
             method=method,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
         )
         if self.api_key:
             request.add_header("X-API-KEY", self.api_key)
@@ -59,8 +70,13 @@ class DatabaseAgentClient:
         except Exception as exc:
             return {"status": "failed", "error": str(exc)}
 
-    def create_skill_execution_log(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        return self._request("POST", "/skills/execution-logs", payload)
+    def create_skill_execution_log(
+        self,
+        payload: Dict[str, Any],
+        *,
+        correlation_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return self._request("POST", "/skills/execution-logs", payload, correlation_id=correlation_id)
 
     def rank_skills(
         self,
@@ -70,6 +86,7 @@ class DatabaseAgentClient:
         strategy_bucket: Optional[str] = None,
         market_regime: Optional[str] = None,
         limit: int = 20,
+        correlation_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         query = [f"account_id={urllib.parse.quote(str(account_id))}", f"limit={limit}"]
         if symbol:
@@ -78,8 +95,13 @@ class DatabaseAgentClient:
             query.append(f"strategy_bucket={urllib.parse.quote(strategy_bucket)}")
         if market_regime:
             query.append(f"market_regime={urllib.parse.quote(market_regime)}")
-        return self._request("GET", f"/skills/performance/rank?{'&'.join(query)}")
+        return self._request("GET", f"/skills/performance/rank?{'&'.join(query)}", correlation_id=correlation_id)
 
-    def get_skill_backtest_status(self, skill_id: str) -> Dict[str, Any]:
+    def get_skill_backtest_status(
+        self,
+        skill_id: str,
+        *,
+        correlation_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         safe_skill_id = urllib.parse.quote(skill_id, safe="")
-        return self._request("GET", f"/skills/{safe_skill_id}/backtest-status")
+        return self._request("GET", f"/skills/{safe_skill_id}/backtest-status", correlation_id=correlation_id)
