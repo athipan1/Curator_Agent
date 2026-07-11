@@ -7,13 +7,35 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from app.models import SkillCreateRequest, SkillDetail, SkillRecord
+from app.models import (
+    SkillCreateRequest,
+    SkillDetail,
+    SkillRecord,
+    SkillVersionCreateRequest,
+)
 from app.validator import SafeSkillValidator
 
 
 APPROVAL_DRAFT = "draft"
 APPROVAL_APPROVED = "approved"
 APPROVAL_DEPRECATED = "deprecated"
+
+DEPLOYMENT_CANDIDATE = "candidate"
+DEPLOYMENT_SHADOW = "shadow"
+DEPLOYMENT_CHALLENGER = "challenger"
+DEPLOYMENT_CHAMPION = "champion"
+DEPLOYMENT_DEGRADED = "degraded"
+DEPLOYMENT_QUARANTINED = "quarantined"
+DEPLOYMENT_RETIRED = "retired"
+DEPLOYMENT_STAGES = {
+    DEPLOYMENT_CANDIDATE,
+    DEPLOYMENT_SHADOW,
+    DEPLOYMENT_CHALLENGER,
+    DEPLOYMENT_CHAMPION,
+    DEPLOYMENT_DEGRADED,
+    DEPLOYMENT_QUARANTINED,
+    DEPLOYMENT_RETIRED,
+}
 
 
 def _utc_now() -> datetime:
@@ -26,6 +48,10 @@ def _json_dump(value) -> str:
 
 def _json_load(value: str):
     return json.loads(value) if value else None
+
+
+def _code_hash(code: str) -> str:
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()
 
 
 class SkillRegistry:
@@ -46,6 +72,11 @@ class SkillRegistry:
                 """
                 CREATE TABLE IF NOT EXISTS skills (
                     skill_id TEXT PRIMARY KEY,
+                    skill_family_id TEXT,
+                    version TEXT NOT NULL DEFAULT '1.0.0',
+                    parent_skill_id TEXT,
+                    deployment_stage TEXT NOT NULL DEFAULT 'candidate',
+                    immutable INTEGER NOT NULL DEFAULT 0,
                     name TEXT NOT NULL,
                     description TEXT NOT NULL,
                     code TEXT NOT NULL,
@@ -64,11 +95,30 @@ class SkillRegistry:
                 )
                 """
             )
+            self._ensure_column(conn, "skill_family_id", "TEXT")
+            self._ensure_column(conn, "version", "TEXT NOT NULL DEFAULT '1.0.0'")
+            self._ensure_column(conn, "parent_skill_id", "TEXT")
+            self._ensure_column(conn, "deployment_stage", "TEXT NOT NULL DEFAULT 'candidate'")
+            self._ensure_column(conn, "immutable", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "approval_status", "TEXT NOT NULL DEFAULT 'draft'")
             self._ensure_column(conn, "lifecycle_notes", "TEXT NOT NULL DEFAULT '[]'")
+            conn.execute(
+                "UPDATE skills SET skill_family_id = skill_id "
+                "WHERE skill_family_id IS NULL OR skill_family_id = ''"
+            )
+            conn.execute(
+                "UPDATE skills SET immutable = 1 WHERE approval_status IN (?, ?)",
+                (APPROVAL_APPROVED, APPROVAL_DEPRECATED),
+            )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_skills_name ON skills(name)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_skills_hash ON skills(code_hash)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_skills_approval ON skills(approval_status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_skills_family ON skills(skill_family_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_skills_stage ON skills(deployment_stage)")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_skills_family_version "
+                "ON skills(skill_family_id, version)"
+            )
 
     @staticmethod
     def _ensure_column(conn: sqlite3.Connection, column_name: str, ddl: str) -> None:
@@ -79,26 +129,52 @@ class SkillRegistry:
     def register(self, request: SkillCreateRequest) -> SkillDetail:
         validation = self.validator.validate(request.code)
         skill_id = request.skill_id or str(uuid.uuid4())
+        family_id = request.skill_family_id or skill_id
         now = _utc_now().isoformat()
-        code_hash = hashlib.sha256(request.code.encode("utf-8")).hexdigest()
+        code_hash = _code_hash(request.code)
         validation_status = "validated" if validation.approved else "rejected"
-        approval_status = APPROVAL_DRAFT
         validation_errors = validation.errors + [f"warning: {item}" for item in validation.warnings]
 
         with self._connect() as conn:
-            existing = conn.execute("SELECT skill_id FROM skills WHERE skill_id = ?", (skill_id,)).fetchone()
+            existing = conn.execute("SELECT * FROM skills WHERE skill_id = ?", (skill_id,)).fetchone()
             if existing is not None:
-                return self.get(skill_id)
+                if existing["code_hash"] != code_hash:
+                    raise ValueError("immutable_skill_id_code_hash_mismatch")
+                return self._to_detail(existing)
+            duplicate_version = conn.execute(
+                "SELECT skill_id, code_hash FROM skills WHERE skill_family_id = ? AND version = ?",
+                (family_id, request.version),
+            ).fetchone()
+            if duplicate_version is not None:
+                if duplicate_version["code_hash"] != code_hash:
+                    raise ValueError("skill_family_version_already_exists_with_different_code")
+                return self.get(duplicate_version["skill_id"])
+            if request.parent_skill_id:
+                parent = conn.execute(
+                    "SELECT skill_family_id FROM skills WHERE skill_id = ?",
+                    (request.parent_skill_id,),
+                ).fetchone()
+                if parent is None:
+                    raise ValueError("parent_skill_not_found")
+                if parent["skill_family_id"] != family_id:
+                    raise ValueError("parent_skill_family_mismatch")
             conn.execute(
                 """
                 INSERT INTO skills (
-                    skill_id, name, description, code, code_hash, tags, market_context,
-                    input_schema, output_schema, source_agent, validation_status,
-                    approval_status, validation_errors, lifecycle_notes, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    skill_id, skill_family_id, version, parent_skill_id,
+                    deployment_stage, immutable, name, description, code, code_hash,
+                    tags, market_context, input_schema, output_schema, source_agent,
+                    validation_status, approval_status, validation_errors,
+                    lifecycle_notes, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     skill_id,
+                    family_id,
+                    request.version,
+                    request.parent_skill_id,
+                    request.deployment_stage,
+                    0,
                     request.name,
                     request.description,
                     request.code,
@@ -109,15 +185,49 @@ class SkillRegistry:
                     _json_dump(request.output_schema),
                     request.source_agent,
                     validation_status,
-                    approval_status,
+                    APPROVAL_DRAFT,
                     _json_dump(validation_errors),
                     _json_dump([]),
                     now,
                     now,
                 ),
             )
-
         return self.get(skill_id)
+
+    def create_version(
+        self,
+        parent_skill_id: str,
+        request: SkillVersionCreateRequest,
+    ) -> SkillDetail:
+        parent = self.get(parent_skill_id)
+        return self.register(
+            SkillCreateRequest(
+                skill_family_id=parent.skill_family_id,
+                version=request.version,
+                parent_skill_id=parent.skill_id,
+                deployment_stage=DEPLOYMENT_CANDIDATE,
+                name=parent.name,
+                description=request.description or parent.description,
+                code=request.code,
+                tags=parent.tags if request.tags is None else request.tags,
+                market_context=(
+                    parent.market_context
+                    if request.market_context is None
+                    else request.market_context
+                ),
+                input_schema=(
+                    parent.input_schema
+                    if request.input_schema is None
+                    else request.input_schema
+                ),
+                output_schema=(
+                    parent.output_schema
+                    if request.output_schema is None
+                    else request.output_schema
+                ),
+                source_agent=request.source_agent or parent.source_agent,
+            )
+        )
 
     def list(
         self,
@@ -125,23 +235,26 @@ class SkillRegistry:
         tag: str | None = None,
         validation_status: str | None = None,
         approval_status: str | None = None,
+        skill_family_id: str | None = None,
+        deployment_stage: str | None = None,
     ) -> list[SkillRecord]:
         query = "SELECT * FROM skills"
         params: list[str] = []
         filters: list[str] = []
-        if validation_status:
-            filters.append("validation_status = ?")
-            params.append(validation_status)
-        if approval_status:
-            filters.append("approval_status = ?")
-            params.append(approval_status)
+        for column, value in (
+            ("validation_status", validation_status),
+            ("approval_status", approval_status),
+            ("skill_family_id", skill_family_id),
+            ("deployment_stage", deployment_stage),
+        ):
+            if value:
+                filters.append(f"{column} = ?")
+                params.append(value)
         if filters:
             query += " WHERE " + " AND ".join(filters)
         query += " ORDER BY created_at DESC"
-
         with self._connect() as conn:
             rows = [self._to_record(row) for row in conn.execute(query, params).fetchall()]
-
         if tag:
             normalized_tag = tag.lower().strip()
             rows = [row for row in rows if normalized_tag in {item.lower() for item in row.tags}]
@@ -154,12 +267,7 @@ class SkillRegistry:
             raise KeyError(skill_id)
         return self._to_detail(row)
 
-    def search(
-        self,
-        query: str,
-        *,
-        approval_status: str | None = None,
-    ) -> list[SkillRecord]:
+    def search(self, query: str, *, approval_status: str | None = None) -> list[SkillRecord]:
         lowered = query.lower().strip()
         candidates = self.list(approval_status=approval_status)
         if not lowered:
@@ -169,41 +277,84 @@ class SkillRegistry:
             for skill in candidates
             if lowered in skill.name.lower()
             or lowered in skill.description.lower()
+            or lowered in skill.version.lower()
+            or lowered in skill.skill_family_id.lower()
             or any(lowered in tag.lower() for tag in skill.tags)
             or lowered in json.dumps(skill.market_context, ensure_ascii=False).lower()
         ]
 
-    def approve(
-        self,
-        skill_id: str,
-        *,
-        approved_by: str | None = None,
-        reason: str | None = None,
-    ) -> SkillDetail:
+    def approve(self, skill_id: str, *, approved_by: str | None = None, reason: str | None = None) -> SkillDetail:
         skill = self.get(skill_id)
         if skill.validation_status != "validated":
             raise ValueError("only_validated_skills_can_be_approved")
         return self._transition(
             skill_id,
             approval_status=APPROVAL_APPROVED,
+            immutable=True,
             note=self._lifecycle_note("approved", actor=approved_by, reason=reason),
         )
 
-    def deprecate(
-        self,
-        skill_id: str,
-        *,
-        approved_by: str | None = None,
-        reason: str | None = None,
-    ) -> SkillDetail:
+    def deprecate(self, skill_id: str, *, approved_by: str | None = None, reason: str | None = None) -> SkillDetail:
         self.get(skill_id)
         return self._transition(
             skill_id,
             approval_status=APPROVAL_DEPRECATED,
+            deployment_stage=DEPLOYMENT_RETIRED,
+            immutable=True,
             note=self._lifecycle_note("deprecated", actor=approved_by, reason=reason),
         )
 
-    def _transition(self, skill_id: str, *, approval_status: str, note: dict) -> SkillDetail:
+    def promote(
+        self,
+        skill_id: str,
+        *,
+        deployment_stage: str,
+        approved_by: str | None = None,
+        reason: str | None = None,
+    ) -> SkillDetail:
+        if deployment_stage not in DEPLOYMENT_STAGES:
+            raise ValueError("invalid_deployment_stage")
+        skill = self.get(skill_id)
+        if deployment_stage not in {DEPLOYMENT_CANDIDATE, DEPLOYMENT_RETIRED}:
+            if skill.validation_status != "validated" or skill.approval_status != APPROVAL_APPROVED:
+                raise ValueError("only_validated_approved_skills_can_be_deployed")
+        with self._connect() as conn:
+            if deployment_stage == DEPLOYMENT_CHAMPION:
+                current = conn.execute(
+                    "SELECT skill_id FROM skills WHERE skill_family_id = ? "
+                    "AND deployment_stage = ? AND skill_id != ?",
+                    (skill.skill_family_id, DEPLOYMENT_CHAMPION, skill_id),
+                ).fetchall()
+                for row in current:
+                    self._transition(
+                        row["skill_id"],
+                        deployment_stage=DEPLOYMENT_RETIRED,
+                        note=self._lifecycle_note(
+                            "champion_replaced",
+                            actor=approved_by,
+                            reason=f"replaced_by={skill_id}; {reason or ''}".strip(),
+                        ),
+                    )
+        return self._transition(
+            skill_id,
+            deployment_stage=deployment_stage,
+            immutable=skill.immutable or deployment_stage != DEPLOYMENT_CANDIDATE,
+            note=self._lifecycle_note(
+                f"deployment_stage:{deployment_stage}",
+                actor=approved_by,
+                reason=reason,
+            ),
+        )
+
+    def _transition(
+        self,
+        skill_id: str,
+        *,
+        approval_status: str | None = None,
+        deployment_stage: str | None = None,
+        immutable: bool | None = None,
+        note: dict,
+    ) -> SkillDetail:
         current = self.get(skill_id)
         notes = [*current.lifecycle_notes, note]
         now = _utc_now().isoformat()
@@ -211,10 +362,18 @@ class SkillRegistry:
             conn.execute(
                 """
                 UPDATE skills
-                SET approval_status = ?, lifecycle_notes = ?, updated_at = ?
+                SET approval_status = ?, deployment_stage = ?, immutable = ?,
+                    lifecycle_notes = ?, updated_at = ?
                 WHERE skill_id = ?
                 """,
-                (approval_status, _json_dump(notes), now, skill_id),
+                (
+                    approval_status or current.approval_status,
+                    deployment_stage or current.deployment_stage,
+                    int(current.immutable if immutable is None else immutable),
+                    _json_dump(notes),
+                    now,
+                    skill_id,
+                ),
             )
         return self.get(skill_id)
 
@@ -231,6 +390,11 @@ class SkillRegistry:
     def _to_record(row: sqlite3.Row) -> SkillRecord:
         return SkillRecord(
             skill_id=row["skill_id"],
+            skill_family_id=row["skill_family_id"] or row["skill_id"],
+            version=row["version"] or "1.0.0",
+            parent_skill_id=row["parent_skill_id"],
+            deployment_stage=row["deployment_stage"] or DEPLOYMENT_CANDIDATE,
+            immutable=bool(row["immutable"]),
             name=row["name"],
             description=row["description"],
             code_hash=row["code_hash"],

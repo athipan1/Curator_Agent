@@ -6,6 +6,17 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
 
+DeploymentStage = Literal[
+    "candidate",
+    "shadow",
+    "challenger",
+    "champion",
+    "degraded",
+    "quarantined",
+    "retired",
+]
+
+
 class StandardResponse(BaseModel):
     status: str = "success"
     agent_type: str = "curator-agent"
@@ -15,6 +26,10 @@ class StandardResponse(BaseModel):
 
 class SkillCreateRequest(BaseModel):
     skill_id: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    skill_family_id: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    version: str = Field(default="1.0.0", min_length=1, max_length=40)
+    parent_skill_id: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    deployment_stage: DeploymentStage = "candidate"
     name: str = Field(..., min_length=1, max_length=120)
     description: str = Field(..., min_length=1, max_length=2000)
     code: str = Field(..., min_length=1)
@@ -23,6 +38,23 @@ class SkillCreateRequest(BaseModel):
     input_schema: Dict[str, Any] = Field(default_factory=dict)
     output_schema: Dict[str, Any] = Field(default_factory=dict)
     source_agent: Optional[str] = Field(default=None, max_length=120)
+
+
+class SkillVersionCreateRequest(BaseModel):
+    version: str = Field(..., min_length=1, max_length=40)
+    code: str = Field(..., min_length=1)
+    description: Optional[str] = Field(default=None, min_length=1, max_length=2000)
+    tags: Optional[List[str]] = None
+    market_context: Optional[Dict[str, Any]] = None
+    input_schema: Optional[Dict[str, Any]] = None
+    output_schema: Optional[Dict[str, Any]] = None
+    source_agent: Optional[str] = Field(default=None, max_length=120)
+
+
+class SkillPromotionRequest(BaseModel):
+    deployment_stage: DeploymentStage
+    reason: Optional[str] = Field(default=None, max_length=1000)
+    approved_by: Optional[str] = Field(default=None, max_length=120)
 
 
 class SkillLifecycleRequest(BaseModel):
@@ -76,6 +108,9 @@ class SkillRecommendationRequest(BaseModel):
 
 class RecommendedSkill(BaseModel):
     skill_id: str
+    skill_family_id: str
+    version: str
+    deployment_stage: DeploymentStage = "candidate"
     name: str
     score: float = Field(default=0.0, ge=0.0, le=1.0)
     approval_status: str
@@ -96,6 +131,11 @@ class SkillRecommendationResponse(BaseModel):
 
 class SkillRecord(BaseModel):
     skill_id: str
+    skill_family_id: str
+    version: str = "1.0.0"
+    parent_skill_id: Optional[str] = None
+    deployment_stage: DeploymentStage = "candidate"
+    immutable: bool = False
     name: str
     description: str
     code_hash: str
