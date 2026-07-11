@@ -3,6 +3,7 @@ from __future__ import annotations
 from app.main_legacy import *  # noqa: F401,F403
 import app.main_legacy as _legacy
 
+from app.container_sandbox import ContainerSandboxExecutor, OptionalContainerExecutor
 from app.database_client import DatabaseAgentClient
 from app.executor import SafeSkillExecutor
 from app.performance_aware_executor import PerformanceAwareExecutor
@@ -22,9 +23,14 @@ def create_app(
 ):
     skill_registry = registry or SkillRegistry(DEFAULT_DB_PATH)
     skill_database_client = database_client or DatabaseAgentClient()
+    base_executor = executor or SafeSkillExecutor()
+    isolated_executor = OptionalContainerExecutor(
+        container=ContainerSandboxExecutor(),
+        fallback=base_executor,
+    )
     schema_executor = SchemaEnforcingExecutor(
         registry=skill_registry,
-        delegate=executor or SafeSkillExecutor(),
+        delegate=isolated_executor,
     )
     performance_executor = PerformanceAwareExecutor(
         delegate=schema_executor,
@@ -41,6 +47,8 @@ def create_app(
     app.state.confidence_calibration_enabled = True
     app.state.performance_decay_advisory_enabled = True
     app.state.champion_challenger_shadow_enabled = True
+    app.state.container_sandbox_enabled = isolated_executor.enabled
+    app.state.container_sandbox_fallback_enabled = isolated_executor.allow_fallback
     return app
 
 
