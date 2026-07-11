@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -134,7 +134,8 @@ def build_shadow_ensemble_router(registry: SkillRegistry, executor: Any) -> APIR
 
         executions: List[Dict[str, Any]] = []
         diversity_groups: set[str] = set()
-        for skill in skills:
+        for skill_record in skills:
+            skill = registry.get(skill_record.skill_id)
             result = executor.execute(
                 skill_id=skill.skill_id,
                 code=skill.code,
