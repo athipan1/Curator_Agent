@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
 
 from app.main import create_app
-from app.models import SkillCreateRequest
+from app.models import SkillCreateRequest, SkillVersionCreateRequest
 from app.registry import SkillRegistry
 
 
@@ -22,7 +22,8 @@ class _NoDatabase:
         return {"status": "skipped", "data": {}}
 
 
-def _client(tmp_path):
+def _client(tmp_path, monkeypatch):
+    monkeypatch.setenv("CURATOR_SEED_BACKTEST_SKILL", "false")
     registry = SkillRegistry(str(tmp_path / "curator.sqlite3"))
     app = create_app(registry=registry, database_client=_NoDatabase())
     return TestClient(app), registry
@@ -43,8 +44,8 @@ def _seed(registry):
     )
 
 
-def test_create_version_endpoint_preserves_lineage(tmp_path):
-    client, registry = _client(tmp_path)
+def test_create_version_endpoint_preserves_lineage(tmp_path, monkeypatch):
+    client, registry = _client(tmp_path, monkeypatch)
     parent = _seed(registry)
 
     response = client.post(
@@ -62,15 +63,12 @@ def test_create_version_endpoint_preserves_lineage(tmp_path):
     assert data["next_step"] == "validate_backtest_approve_then_promote"
 
 
-def test_family_endpoints_show_all_versions_and_champion(tmp_path):
-    client, registry = _client(tmp_path)
+def test_family_endpoints_show_all_versions_and_champion(tmp_path, monkeypatch):
+    client, registry = _client(tmp_path, monkeypatch)
     first = _seed(registry)
     second = registry.create_version(
         first.skill_id,
-        __import__("app.models", fromlist=["SkillVersionCreateRequest"]).SkillVersionCreateRequest(
-            version="2.0.0",
-            code=CODE_V2,
-        ),
+        SkillVersionCreateRequest(version="2.0.0", code=CODE_V2),
     )
     registry.approve(first.skill_id)
     registry.approve(second.skill_id)
@@ -85,11 +83,13 @@ def test_family_endpoints_show_all_versions_and_champion(tmp_path):
     assert family["champion_skill_id"] == second.skill_id
     assert family["champion_version"] == "2.0.0"
     assert listing.status_code == 200
-    assert listing.json()["data"]["family_count"] == 1
+    listing_data = listing.json()["data"]
+    assert listing_data["family_count"] == 1
+    assert listing_data["families"][0]["skill_family_id"] == "momentum-family"
 
 
-def test_promote_endpoint_requires_validated_approved_skill(tmp_path):
-    client, registry = _client(tmp_path)
+def test_promote_endpoint_requires_validated_approved_skill(tmp_path, monkeypatch):
+    client, registry = _client(tmp_path, monkeypatch)
     skill = _seed(registry)
 
     blocked = client.post(
@@ -115,11 +115,9 @@ def test_promote_endpoint_requires_validated_approved_skill(tmp_path):
     assert data["broker_access"] is False
 
 
-def test_rollback_endpoint_restores_prior_version_as_champion(tmp_path):
-    client, registry = _client(tmp_path)
+def test_rollback_endpoint_restores_prior_version_as_champion(tmp_path, monkeypatch):
+    client, registry = _client(tmp_path, monkeypatch)
     first = _seed(registry)
-    from app.models import SkillVersionCreateRequest
-
     second = registry.create_version(
         first.skill_id,
         SkillVersionCreateRequest(version="2.0.0", code=CODE_V2),
@@ -144,8 +142,8 @@ def test_rollback_endpoint_restores_prior_version_as_champion(tmp_path):
     assert registry.get(second.skill_id).deployment_stage == "retired"
 
 
-def test_missing_family_and_skill_return_not_found(tmp_path):
-    client, _registry = _client(tmp_path)
+def test_missing_family_and_skill_return_not_found(tmp_path, monkeypatch):
+    client, _registry = _client(tmp_path, monkeypatch)
 
     assert client.get("/skill-families/missing").status_code == 404
     assert client.post(
