@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import multiprocessing as mp
 import queue
 import time
@@ -42,9 +43,43 @@ FORBIDDEN_OUTPUT_KEYS = {
     "private_key",
 }
 
+FORBIDDEN_INTROSPECTION_ATTRIBUTES = {
+    "__bases__",
+    "__class__",
+    "__closure__",
+    "__code__",
+    "__func__",
+    "__globals__",
+    "__mro__",
+    "__self__",
+    "__subclasses__",
+}
+
 
 class SkillExecutionError(Exception):
-    """Raised when a curated skill cannot be safely executed."""
+    """Raised when a curated skill cannot be executed by the best-effort runner."""
+
+
+def _validate_best_effort_code(code: str) -> None:
+    """Reject common Python introspection escapes before process-level exec().
+
+    This is defense in depth only. Python-level AST and builtins restrictions are
+    not a security boundary and must not replace container isolation.
+    """
+
+    try:
+        tree = ast.parse(code, filename="<curator_skill>", mode="exec")
+    except SyntaxError as exc:
+        raise SkillExecutionError(f"skill_syntax_error: {exc.msg}") from exc
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and (
+            node.attr in FORBIDDEN_INTROSPECTION_ATTRIBUTES
+            or (node.attr.startswith("__") and node.attr.endswith("__"))
+        ):
+            raise SkillExecutionError(f"forbidden_introspection_attribute: {node.attr}")
+        if isinstance(node, ast.Name) and node.id in FORBIDDEN_INTROSPECTION_ATTRIBUTES:
+            raise SkillExecutionError(f"forbidden_introspection_name: {node.id}")
 
 
 def _json_safe(value: Any) -> Any:
@@ -128,11 +163,13 @@ def _execute_in_child(
 
 
 class SafeSkillExecutor:
-    """Runs approved curated skills in a short-lived, restricted process.
+    """Best-effort isolation for approved skills; this is not a true sandbox.
 
-    This MVP intentionally does not expose broker credentials, file IO, network
-    clients, imports, or order-placement helpers. Skills receive a JSON-like input
-    payload and must return a JSON object such as signal/confidence/reason.
+    The runner uses a short-lived process, restricted builtins, an AST check for
+    common introspection escapes, and a timeout. These controls reduce accidental
+    misuse but cannot make Python ``exec()`` safe against hostile code. Production
+    execution must use ``ContainerSandboxExecutor``; this runner exists only for an
+    explicit operator opt-out or emergency compatibility fallback.
     """
 
     def execute(
@@ -144,6 +181,17 @@ class SafeSkillExecutor:
         function_name: str | None = None,
         timeout_seconds: float = 1.0,
     ) -> Dict[str, Any]:
+        try:
+            _validate_best_effort_code(code)
+        except SkillExecutionError as exc:
+            return {
+                "skill_id": skill_id,
+                "execution_status": "rejected_unsafe_code",
+                "error": str(exc),
+                "output": {},
+                "isolation": "best_effort_not_a_true_sandbox",
+            }
+
         timeout = max(0.1, min(float(timeout_seconds or 1.0), 5.0))
         result_queue: mp.Queue = mp.Queue(maxsize=1)
         started = time.perf_counter()
@@ -201,4 +249,5 @@ class SafeSkillExecutor:
                 "file_access": False,
                 "order_placement": False,
             },
+            "isolation": "best_effort_not_a_true_sandbox",
         }
