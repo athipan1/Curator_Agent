@@ -1,12 +1,16 @@
 # Curator Agent
 
-Curator Agent is a safe registry service for reusable trading-analysis skills in the multi-agent trading system.
+Curator Agent is a registry and isolated execution service for reusable trading-analysis
+skills in the multi-agent trading system.
 
-The first phase stores, validates, and approves candidate Python skills. The current MVP also adds a conservative sandbox execution endpoint for **approved signal-only skills**. Curator does not place broker orders and does not expose broker credentials to stored code.
+The service stores, validates, and approves candidate Python skills. Approved signal-only
+skills execute in an ephemeral Docker container by default. Curator does not place broker
+orders and does not expose broker credentials to stored code.
 
 ## Why this exists
 
-A trading agent stack can waste time and tokens repeatedly asking LLMs to rediscover the same logic. Curator Agent stores reusable skills such as:
+A trading agent stack can waste time and tokens repeatedly asking LLMs to rediscover the
+same logic. Curator Agent stores reusable skills such as:
 
 - technical signal functions
 - market-regime filters
@@ -25,7 +29,7 @@ Human/Risk owner
         ↓ approves safe, reviewed skills
 Manager Agent / Orchestrator
         ↓ retrieves approved skills by market context
-Safe Sandbox Runner
+Isolated Container Sandbox (default)
         ↓ emits signal only, never places orders directly
 Risk Agent → Execution Agent → Broker
 ```
@@ -54,14 +58,55 @@ Validation and approval are separate:
 - `validation_status=validated` means the static safety validator passed.
 - `validation_status=rejected` means the skill failed static safety validation.
 - `approval_status=draft` means the skill is stored but not production-approved.
-- `approval_status=approved` means the skill has been reviewed and can be retrieved/executed by production agents.
+- `approval_status=approved` means the skill has been reviewed and can execute.
 - `approval_status=deprecated` means the skill should no longer be selected for new use.
 
 Only `validated` skills can be approved. Only `validated + approved` skills can execute.
 
-## Safety rules
+## Security and isolation
 
-The static validator rejects obvious unsafe Python constructs:
+Container isolation is enabled by default:
+
+```bash
+CURATOR_CONTAINER_SANDBOX_ENABLED=true
+CURATOR_CONTAINER_SANDBOX_FALLBACK=false
+CURATOR_SANDBOX_IMAGE=curator-skill-sandbox:latest
+```
+
+Production must provide a working Docker daemon and the configured sandbox image. The
+container retains all existing hardening controls:
+
+- `--network=none`
+- a read-only root filesystem
+- `--cap-drop=ALL`
+- `no-new-privileges`
+- CPU, memory, and PID limits
+- an unprivileged user and restricted temporary filesystem
+
+If Docker or the image is unavailable, or container startup fails, the request fails closed
+with `execution_status="rejected_no_isolated_sandbox"`. Skill code is not executed by the
+process runner.
+
+### Explicit compatibility fallback
+
+`CURATOR_CONTAINER_SANDBOX_FALLBACK=true` permits an intentional downgrade to the
+process-level runner when container execution is unavailable or fails. This setting is
+high-risk and should be temporary. Every use:
+
+- emits a `CRITICAL` log containing `SECURITY ALERT`
+- increments `curator_container_sandbox_fallback_total`
+- returns `fallback_used=true` and `security_alert="isolated_sandbox_fallback_used"`
+
+The fallback runner uses restricted builtins, a separate process, timeouts, and AST checks
+that reject common introspection paths such as `__class__`, `__bases__`, `__subclasses__`,
+and `__globals__`. These controls are defense in depth only. Python `exec()` restrictions
+are **best-effort isolation, not a true sandbox**, and do not provide a security guarantee
+against hostile code.
+
+Setting `CURATOR_CONTAINER_SANDBOX_ENABLED=false` is an explicit operator opt-out and uses
+the same best-effort process runner without first attempting container execution.
+
+The static validator also rejects obvious unsafe Python constructs:
 
 - `import` / `from import`
 - `global` / `nonlocal`
@@ -70,17 +115,7 @@ The static validator rejects obvious unsafe Python constructs:
 - dunder names/functions
 - code with no function definition
 
-Rejected skills are still stored with `validation_status="rejected"` so they can be audited.
-
-The execution sandbox is intentionally narrow:
-
-- runs in a short-lived restricted process
-- no broker credentials are injected
-- no network clients are injected
-- no file IO helpers are available
-- timeout is capped between `0.1` and `5.0` seconds
-- skill output must be a JSON object
-- broker/order-like output keys such as `order_id`, `broker_order_id`, and `risk_approval_id` are rejected
+Rejected skills remain stored with `validation_status="rejected"` for auditability.
 
 Curator should emit **signals only**, for example:
 
@@ -101,11 +136,24 @@ pip install -e ".[dev]"
 uvicorn app.main:app --reload --port 8010
 ```
 
+The secure default requires Docker and the sandbox image even for local skill execution.
+Build the image before calling the execution endpoint:
+
+```bash
+docker build -t curator-skill-sandbox:latest -f sandbox/Dockerfile .
+```
+
+For local compatibility testing only, operators may intentionally opt out with
+`CURATOR_CONTAINER_SANDBOX_ENABLED=false`. Do not use that setting for untrusted code.
+
 ## Run tests
 
 ```bash
 PYTHONPATH=. python -m pytest -q
 ```
+
+Tests explicitly opt out of Docker unless they are verifying the container execution path.
+Dedicated tests remove that override and assert the secure production defaults.
 
 ## Docker
 
@@ -113,6 +161,11 @@ PYTHONPATH=. python -m pytest -q
 docker build -t curator-agent .
 docker run --rm -p 8010:8010 -v curator-data:/data curator-agent
 ```
+
+Running Curator itself in a container does not automatically make the sandbox available.
+Production must also provide a controlled Docker execution facility and the
+`curator-skill-sandbox:latest` image. If it does not, all skill execution is rejected by
+default instead of silently downgrading isolation.
 
 ## Example skill registration
 
@@ -147,22 +200,18 @@ curl -X POST http://localhost:8010/skills/<skill_id>/execute \
   }'
 ```
 
-Expected response shape:
+Expected successful response data includes the container security metadata:
 
 ```json
 {
-  "status": "success",
-  "agent_type": "curator-agent",
-  "version": "0.1.0",
-  "data": {
-    "execution_status": "success",
-    "output": {"signal": "buy", "confidence": 0.7},
-    "safety": {
-      "broker_access": false,
-      "network_access": false,
-      "file_access": false,
-      "order_placement": false
-    }
+  "execution_status": "success",
+  "output": {"signal": "buy", "confidence": 0.7},
+  "sandbox": {
+    "mode": "container",
+    "network_access": false,
+    "read_only_filesystem": true,
+    "capabilities_dropped": true,
+    "no_new_privileges": true
   }
 }
 ```
@@ -171,6 +220,6 @@ Expected response shape:
 
 1. Add semantic skill search.
 2. Add signed skill versions.
-3. Move sandbox execution into a fully isolated Docker runtime profile.
+3. Export fallback counters through the shared observability backend.
 4. Add Manager_Agent integration to query approved skills by market context.
-5. Add Skill performance tracking after backtests and paper-trade observation.
+5. Add skill performance tracking after backtests and paper-trade observation.
