@@ -1,12 +1,40 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Dict
+
+
+logger = logging.getLogger(__name__)
+
+
+class SandboxFallbackCounter:
+    """Thread-safe process-local counter for explicit isolation downgrades."""
+
+    metric_name = "curator_container_sandbox_fallback_total"
+
+    def __init__(self) -> None:
+        self._total = 0
+        self._lock = threading.Lock()
+
+    def increment(self) -> int:
+        with self._lock:
+            self._total += 1
+            return self._total
+
+    @property
+    def total(self) -> int:
+        with self._lock:
+            return self._total
+
+
+DEFAULT_SANDBOX_FALLBACK_COUNTER = SandboxFallbackCounter()
 
 
 class ContainerSandboxExecutor:
@@ -149,34 +177,74 @@ class ContainerSandboxExecutor:
 
 
 class OptionalContainerExecutor:
-    """Use container mode when enabled, with an explicit compatibility fallback."""
+    """Prefer container isolation and fail closed unless fallback is explicitly enabled."""
 
-    def __init__(self, *, container: ContainerSandboxExecutor, fallback: Any) -> None:
+    def __init__(
+        self,
+        *,
+        container: ContainerSandboxExecutor,
+        fallback: Any,
+        fallback_counter: SandboxFallbackCounter | None = None,
+    ) -> None:
         self.container = container
         self.fallback = fallback
-        self.enabled = os.getenv("CURATOR_CONTAINER_SANDBOX_ENABLED", "false").lower() == "true"
-        self.allow_fallback = os.getenv("CURATOR_CONTAINER_SANDBOX_FALLBACK", "true").lower() == "true"
+        self.fallback_counter = fallback_counter or DEFAULT_SANDBOX_FALLBACK_COUNTER
+        self.enabled = os.getenv("CURATOR_CONTAINER_SANDBOX_ENABLED", "true").lower() == "true"
+        self.allow_fallback = (
+            os.getenv("CURATOR_CONTAINER_SANDBOX_FALLBACK", "false").lower() == "true"
+        )
 
     def execute(self, **kwargs: Any) -> Dict[str, Any]:
         if not self.enabled:
             result = self.fallback.execute(**kwargs)
-            result.setdefault("sandbox", {"mode": "process", "container_enabled": False})
+            result.setdefault(
+                "sandbox",
+                {
+                    "mode": "process",
+                    "container_enabled": False,
+                    "isolation": "best_effort_not_a_true_sandbox",
+                },
+            )
             return result
 
-        result = self.container.execute(**kwargs)
-        if result.get("execution_status") not in {"container_unavailable", "container_failed"}:
-            return result
+        container_result = self.container.execute(**kwargs)
+        container_status = container_result.get("execution_status")
+        if container_status not in {"container_unavailable", "container_failed"}:
+            return container_result
+
         if not self.allow_fallback:
-            result["fallback_used"] = False
-            return result
+            return {
+                **container_result,
+                "execution_status": "rejected_no_isolated_sandbox",
+                "error": "isolated_container_sandbox_required",
+                "container_execution_status": container_status,
+                "container_error": container_result.get("error"),
+                "fallback_used": False,
+                "output": {},
+            }
 
+        fallback_total = self.fallback_counter.increment()
+        logger.critical(
+            "SECURITY ALERT: isolated container execution failed; using explicitly enabled "
+            "best-effort process fallback; metric_name=%s metric_value=%d skill_id=%s "
+            "container_execution_status=%s container_error=%s",
+            self.fallback_counter.metric_name,
+            fallback_total,
+            kwargs.get("skill_id"),
+            container_status,
+            container_result.get("error"),
+        )
         fallback_result = self.fallback.execute(**kwargs)
         fallback_result["sandbox"] = {
             "mode": "process_fallback",
             "container_enabled": True,
-            "container_error": result.get("error"),
+            "container_execution_status": container_status,
+            "container_error": container_result.get("error"),
+            "isolation": "best_effort_not_a_true_sandbox",
             "broker_access": False,
             "order_placement": False,
         }
         fallback_result["fallback_used"] = True
+        fallback_result["security_alert"] = "isolated_sandbox_fallback_used"
+        fallback_result[self.fallback_counter.metric_name] = fallback_total
         return fallback_result
