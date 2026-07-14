@@ -1,16 +1,41 @@
 import json
+import logging
 import subprocess
 from types import SimpleNamespace
 
-from app.container_sandbox import ContainerSandboxExecutor, OptionalContainerExecutor
+import pytest
+
+from app.container_sandbox import (
+    ContainerSandboxExecutor,
+    OptionalContainerExecutor,
+    SandboxFallbackCounter,
+)
 
 
 class _Fallback:
+    def __init__(self):
+        self.calls = 0
+
     def execute(self, **kwargs):
+        self.calls += 1
         return {
             "skill_id": kwargs["skill_id"],
             "execution_status": "success",
             "output": {"signal": "hold", "confidence": 0.5},
+        }
+
+
+class _FailedContainer:
+    def __init__(self, status):
+        self.status = status
+
+    def execute(self, **kwargs):
+        return {
+            "skill_id": kwargs["skill_id"],
+            "execution_status": self.status,
+            "error": "simulated_container_error",
+            "output": {},
+            "sandbox": {"mode": "container"},
         }
 
 
@@ -92,6 +117,19 @@ def test_missing_docker_returns_container_unavailable(monkeypatch):
     assert result["error"] == "docker_binary_not_available"
 
 
+def test_container_and_fallback_defaults_are_secure(monkeypatch):
+    monkeypatch.delenv("CURATOR_CONTAINER_SANDBOX_ENABLED", raising=False)
+    monkeypatch.delenv("CURATOR_CONTAINER_SANDBOX_FALLBACK", raising=False)
+
+    executor = OptionalContainerExecutor(
+        container=_FailedContainer("container_unavailable"),
+        fallback=_Fallback(),
+    )
+
+    assert executor.enabled is True
+    assert executor.allow_fallback is False
+
+
 def test_disabled_container_uses_process_executor(monkeypatch):
     monkeypatch.setenv("CURATOR_CONTAINER_SANDBOX_ENABLED", "false")
     executor = OptionalContainerExecutor(
@@ -104,35 +142,51 @@ def test_disabled_container_uses_process_executor(monkeypatch):
     assert result["execution_status"] == "success"
     assert result["sandbox"]["mode"] == "process"
     assert result["sandbox"]["container_enabled"] is False
+    assert result["sandbox"]["isolation"] == "best_effort_not_a_true_sandbox"
 
 
-def test_enabled_container_falls_back_when_docker_missing(monkeypatch):
+@pytest.mark.parametrize("container_status", ["container_unavailable", "container_failed"])
+def test_default_fail_closed_rejects_without_running_fallback(monkeypatch, container_status):
     monkeypatch.setenv("CURATOR_CONTAINER_SANDBOX_ENABLED", "true")
-    monkeypatch.setenv("CURATOR_CONTAINER_SANDBOX_FALLBACK", "true")
-    monkeypatch.setattr("app.container_sandbox.shutil.which", lambda binary: None)
+    monkeypatch.setenv("CURATOR_CONTAINER_SANDBOX_FALLBACK", "false")
+    fallback = _Fallback()
     executor = OptionalContainerExecutor(
-        container=ContainerSandboxExecutor(),
-        fallback=_Fallback(),
+        container=_FailedContainer(container_status),
+        fallback=fallback,
     )
 
     result = executor.execute(**_kwargs())
+
+    assert result["execution_status"] == "rejected_no_isolated_sandbox"
+    assert result["error"] == "isolated_container_sandbox_required"
+    assert result["container_execution_status"] == container_status
+    assert result["container_error"] == "simulated_container_error"
+    assert result["fallback_used"] is False
+    assert result["output"] == {}
+    assert fallback.calls == 0
+
+
+def test_explicit_fallback_emits_critical_alert_and_increments_metric(monkeypatch, caplog):
+    monkeypatch.setenv("CURATOR_CONTAINER_SANDBOX_ENABLED", "true")
+    monkeypatch.setenv("CURATOR_CONTAINER_SANDBOX_FALLBACK", "true")
+    counter = SandboxFallbackCounter()
+    fallback = _Fallback()
+    executor = OptionalContainerExecutor(
+        container=_FailedContainer("container_unavailable"),
+        fallback=fallback,
+        fallback_counter=counter,
+    )
+
+    with caplog.at_level(logging.CRITICAL, logger="app.container_sandbox"):
+        result = executor.execute(**_kwargs())
 
     assert result["execution_status"] == "success"
     assert result["fallback_used"] is True
+    assert result["security_alert"] == "isolated_sandbox_fallback_used"
+    assert result["curator_container_sandbox_fallback_total"] == 1
     assert result["sandbox"]["mode"] == "process_fallback"
-    assert result["sandbox"]["container_error"] == "docker_binary_not_available"
-
-
-def test_strict_container_mode_does_not_fallback(monkeypatch):
-    monkeypatch.setenv("CURATOR_CONTAINER_SANDBOX_ENABLED", "true")
-    monkeypatch.setenv("CURATOR_CONTAINER_SANDBOX_FALLBACK", "false")
-    monkeypatch.setattr("app.container_sandbox.shutil.which", lambda binary: None)
-    executor = OptionalContainerExecutor(
-        container=ContainerSandboxExecutor(),
-        fallback=_Fallback(),
-    )
-
-    result = executor.execute(**_kwargs())
-
-    assert result["execution_status"] == "container_unavailable"
-    assert result["fallback_used"] is False
+    assert result["sandbox"]["isolation"] == "best_effort_not_a_true_sandbox"
+    assert fallback.calls == 1
+    assert counter.total == 1
+    assert "SECURITY ALERT" in caplog.text
+    assert "curator_container_sandbox_fallback_total" in caplog.text
