@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from app.main_legacy import *  # noqa: F401,F403
 import app.main_legacy as _legacy
 
@@ -7,6 +9,7 @@ from app.container_sandbox import ContainerSandboxExecutor, OptionalContainerExe
 from app.database_client import DatabaseAgentClient
 from app.executor import SafeSkillExecutor
 from app.performance_aware_executor import PerformanceAwareExecutor
+from app.readiness import attach_runtime_readiness
 from app.registry import SkillRegistry
 from app.schema_enforcing_executor import SchemaEnforcingExecutor
 from app.shadow_ensemble import attach_shadow_ensemble_routes
@@ -14,6 +17,27 @@ from app.version_api import attach_version_lifecycle_routes
 
 
 DEFAULT_DB_PATH = _legacy.DEFAULT_DB_PATH
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _seeded_backtest_skill_id(registry: SkillRegistry) -> str | None:
+    if not _env_bool("CURATOR_SEED_BACKTEST_SKILL", True):
+        return None
+    skill_id = os.getenv(
+        "CURATOR_SEED_BACKTEST_SKILL_ID",
+        "hourly-sma-crossover",
+    )
+    try:
+        registry.get(skill_id)
+    except KeyError:
+        return None
+    return skill_id
 
 
 def create_app(
@@ -43,6 +67,12 @@ def create_app(
     )
     attach_version_lifecycle_routes(app, skill_registry)
     attach_shadow_ensemble_routes(app, skill_registry, performance_executor)
+    attach_runtime_readiness(
+        app,
+        executor=performance_executor,
+        database_client=skill_database_client,
+        seeded_backtest_skill_id=_seeded_backtest_skill_id(skill_registry),
+    )
     app.state.skill_schema_contracts_enabled = True
     app.state.confidence_calibration_enabled = True
     app.state.performance_decay_advisory_enabled = True

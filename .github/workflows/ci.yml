@@ -5,8 +5,11 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
-  test:
+  unit-test:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -22,5 +25,146 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      - name: Compile source
+        run: python -m compileall -q app sandbox tests
+
       - name: Run tests
         run: PYTHONPATH=. python -m pytest -q
+
+  isolated-sandbox-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CURATOR_DB_PATH: /tmp/curator-sandbox-smoke.sqlite3
+      CURATOR_REQUIRE_API_KEY: "true"
+      CURATOR_EXECUTE_API_KEY: smoke-execute-key
+      CURATOR_ADMIN_API_KEY: smoke-admin-key
+      CURATOR_CONTAINER_SANDBOX_ENABLED: "true"
+      CURATOR_CONTAINER_SANDBOX_FALLBACK: "false"
+      CURATOR_SANDBOX_IMAGE: curator-skill-sandbox:ci
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install service dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Build hardened sandbox image
+        run: docker build -t "$CURATOR_SANDBOX_IMAGE" -f sandbox/Dockerfile .
+
+      - name: Start Curator on the Docker host
+        run: |
+          python -m uvicorn app.main:app --host 127.0.0.1 --port 8010 \
+            > /tmp/curator-sandbox-smoke.log 2>&1 &
+          echo $! > /tmp/curator-sandbox-smoke.pid
+
+      - name: Verify dependency-aware readiness
+        run: |
+          for attempt in {1..30}; do
+            if curl -fsS http://127.0.0.1:8010/ready > /tmp/ready.json; then
+              python - <<'PY'
+          import json
+          payload = json.load(open('/tmp/ready.json', encoding='utf-8'))
+          execution = payload['data']['execution']
+          assert payload['data']['ready'] is True, payload
+          assert execution['mode'] == 'container', payload
+          assert execution['secure_execution_ready'] is True, payload
+          assert execution['image'] == 'curator-skill-sandbox:ci', payload
+          PY
+              exit 0
+            fi
+            sleep 2
+          done
+          cat /tmp/curator-sandbox-smoke.log
+          exit 1
+
+      - name: Register approve and execute a real isolated skill
+        run: |
+          python - <<'PY'
+          import json
+          import urllib.request
+
+          BASE = 'http://127.0.0.1:8010'
+
+          def request(path, payload, key):
+              body = json.dumps(payload).encode('utf-8')
+              req = urllib.request.Request(
+                  BASE + path,
+                  data=body,
+                  method='POST',
+                  headers={
+                      'Content-Type': 'application/json',
+                      'X-API-KEY': key,
+                      'X-Correlation-ID': 'sandbox-smoke-ci',
+                  },
+              )
+              with urllib.request.urlopen(req, timeout=15) as response:
+                  return json.loads(response.read().decode('utf-8'))
+
+          registered = request(
+              '/skills/register',
+              {
+                  'name': 'Isolated Sandbox CI Skill',
+                  'description': 'Executes only inside the real CI sandbox container.',
+                  'code': (
+                      "def signal(price):\n"
+                      "    return {'signal': 'buy' if price < 100 else 'hold', "
+                      "'confidence': 0.75, 'reason': 'sandbox smoke'}"
+                  ),
+                  'input_schema': {
+                      'type': 'object',
+                      'required': ['price'],
+                      'properties': {'price': {'type': 'number'}},
+                      'additionalProperties': False,
+                  },
+                  'output_schema': {
+                      'type': 'object',
+                      'required': ['signal', 'confidence', 'reason'],
+                      'properties': {
+                          'signal': {'type': 'string'},
+                          'confidence': {'type': 'number'},
+                          'reason': {'type': 'string'},
+                      },
+                      'additionalProperties': False,
+                  },
+              },
+              'smoke-admin-key',
+          )
+          skill_id = registered['data']['skill_id']
+          request(
+              f'/skills/{skill_id}/approve',
+              {'approved_by': 'github-actions', 'reason': 'real sandbox smoke'},
+              'smoke-admin-key',
+          )
+          executed = request(
+              f'/skills/{skill_id}/execute',
+              {'inputs': {'price': 90}, 'timeout_seconds': 2.0},
+              'smoke-execute-key',
+          )
+          data = executed['data']
+          assert data['execution_status'] == 'success', executed
+          assert data['output']['signal'] == 'buy', executed
+          assert data['sandbox']['mode'] == 'container', executed
+          assert data.get('fallback_used') is not True, executed
+          assert data['sandbox']['network_access'] is False, executed
+          assert data['sandbox']['read_only_filesystem'] is True, executed
+          PY
+
+      - name: Show service logs on failure
+        if: failure()
+        run: cat /tmp/curator-sandbox-smoke.log || true
+
+      - name: Stop Curator
+        if: always()
+        run: |
+          if [ -f /tmp/curator-sandbox-smoke.pid ]; then
+            kill "$(cat /tmp/curator-sandbox-smoke.pid)" || true
+          fi
