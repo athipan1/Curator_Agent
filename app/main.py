@@ -9,6 +9,7 @@ from app.executor import SafeSkillExecutor
 from app.performance_aware_executor import PerformanceAwareExecutor
 from app.registry import SkillRegistry
 from app.schema_enforcing_executor import SchemaEnforcingExecutor
+from app.security import attach_api_key_auth
 from app.shadow_ensemble import attach_shadow_ensemble_routes
 from app.version_api import attach_version_lifecycle_routes
 
@@ -43,12 +44,15 @@ def create_app(
     )
     attach_version_lifecycle_routes(app, skill_registry)
     attach_shadow_ensemble_routes(app, skill_registry, performance_executor)
+    auth_config = attach_api_key_auth(app)
     app.state.skill_schema_contracts_enabled = True
     app.state.confidence_calibration_enabled = True
     app.state.performance_decay_advisory_enabled = True
     app.state.champion_challenger_shadow_enabled = True
     app.state.container_sandbox_enabled = isolated_executor.enabled
     app.state.container_sandbox_fallback_enabled = isolated_executor.allow_fallback
+    app.state.api_auth_required = auth_config.required
+    app.state.api_auth_production = auth_config.production
     return app
 
 
