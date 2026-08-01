@@ -20,6 +20,7 @@ from app.models import (
 from app.performance_policy import curate_performance_policy
 from app.recommendations import recommend_skills
 from app.registry import APPROVAL_APPROVED, SkillRegistry
+from app.security import attach_api_key_auth
 from app.seed_skills import seed_default_backtest_skill
 from app.system_contract import (
     CURATOR_AGENT_TYPE,
@@ -52,13 +53,20 @@ def _correlation_id_from_execute_request(request: SkillExecuteRequest) -> Option
     return None
 
 
-def _backtest_status_from_database(skill_id: str, database_client: DatabaseAgentClient) -> SkillBacktestStatusResponse:
+def _backtest_status_from_database(
+    skill_id: str,
+    database_client: DatabaseAgentClient,
+) -> SkillBacktestStatusResponse:
     response = database_client.get_skill_backtest_status(skill_id)
     data = response.get("data") if isinstance(response, dict) else None
     data = data if isinstance(data, dict) else {}
     return SkillBacktestStatusResponse(
         skill_id=skill_id,
-        database_status=str(response.get("status", "unknown")) if isinstance(response, dict) else "unknown",
+        database_status=(
+            str(response.get("status", "unknown"))
+            if isinstance(response, dict)
+            else "unknown"
+        ),
         passed=bool(data.get("passed")),
         status=str(data.get("status", "unknown")),
         latest_run_id=data.get("latest_run_id"),
@@ -124,7 +132,9 @@ def create_app(
                 "skill_search_endpoint": "/skills/search",
                 "skill_recommend_endpoint": "/skills/recommend",
                 "skill_backtest_status_endpoint": "/skills/{skill_id}/backtest-status",
-                "skill_approve_from_backtest_endpoint": "/skills/{skill_id}/approve-from-backtest",
+                "skill_approve_from_backtest_endpoint": (
+                    "/skills/{skill_id}/approve-from-backtest"
+                ),
                 "skill_execute_endpoint": "/skills/{skill_id}/execute",
             },
             metadata={
@@ -171,7 +181,9 @@ def create_app(
             validation_status=validation_status,
             approval_status=approval_status,
         )
-        return StandardResponse(data=[record.model_dump(mode="json") for record in records])
+        return StandardResponse(
+            data=[record.model_dump(mode="json") for record in records]
+        )
 
     @app.get("/skills/search", response_model=StandardResponse)
     async def search_skills(
@@ -179,10 +191,14 @@ def create_app(
         approval_status: Optional[str] = Query(default=None),
     ) -> StandardResponse:
         records = skill_registry.search(q, approval_status=approval_status)
-        return StandardResponse(data=[record.model_dump(mode="json") for record in records])
+        return StandardResponse(
+            data=[record.model_dump(mode="json") for record in records]
+        )
 
     @app.post("/skills/recommend", response_model=StandardResponse)
-    async def recommend_skills_endpoint(request: SkillRecommendationRequest) -> StandardResponse:
+    async def recommend_skills_endpoint(
+        request: SkillRecommendationRequest,
+    ) -> StandardResponse:
         result = recommend_skills(
             registry=skill_registry,
             database_client=skill_database_client,
@@ -216,7 +232,10 @@ def create_app(
         status = _backtest_status_from_database(skill_id, skill_database_client)
         return StandardResponse(data=status.model_dump(mode="json"))
 
-    @app.post("/skills/{skill_id}/approve-from-backtest", response_model=StandardResponse)
+    @app.post(
+        "/skills/{skill_id}/approve-from-backtest",
+        response_model=StandardResponse,
+    )
     async def approve_skill_from_backtest(
         skill_id: str,
         request: SkillBacktestApprovalRequest,
@@ -242,7 +261,13 @@ def create_app(
             record = skill_registry.approve(
                 skill_id,
                 approved_by=request.approved_by,
-                reason=request.reason or f"backtest_status={status.status}; latest_run_id={status.latest_run_id}",
+                reason=(
+                    request.reason
+                    or (
+                        f"backtest_status={status.status}; "
+                        f"latest_run_id={status.latest_run_id}"
+                    )
+                ),
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -270,16 +295,25 @@ def create_app(
         return StandardResponse(data=record.model_dump(mode="json"))
 
     @app.post("/skills/{skill_id}/execute", response_model=StandardResponse)
-    async def execute_skill(skill_id: str, request: SkillExecuteRequest) -> StandardResponse:
+    async def execute_skill(
+        skill_id: str,
+        request: SkillExecuteRequest,
+    ) -> StandardResponse:
         try:
             record = skill_registry.get(skill_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="skill_not_found") from exc
 
         if record.validation_status != "validated":
-            raise HTTPException(status_code=400, detail="only_validated_skills_can_execute")
+            raise HTTPException(
+                status_code=400,
+                detail="only_validated_skills_can_execute",
+            )
         if record.approval_status != APPROVAL_APPROVED:
-            raise HTTPException(status_code=400, detail="only_approved_skills_can_execute")
+            raise HTTPException(
+                status_code=400,
+                detail="only_approved_skills_can_execute",
+            )
 
         result = skill_executor.execute(
             skill_id=record.skill_id,
@@ -327,9 +361,11 @@ def create_app(
             "enabled": skill_database_client.enabled,
             "required": require_database_telemetry,
             "correlation_id": correlation_id,
-            "execution_log_id": (telemetry_result.get("data") or {}).get("execution_log_id")
-            if isinstance(telemetry_result.get("data"), dict)
-            else None,
+            "execution_log_id": (
+                (telemetry_result.get("data") or {}).get("execution_log_id")
+                if isinstance(telemetry_result.get("data"), dict)
+                else None
+            ),
             "error": telemetry_result.get("error"),
         }
         if require_database_telemetry and telemetry_result.get("status") != "success":
@@ -350,6 +386,9 @@ def create_app(
             raise HTTPException(status_code=404, detail="skill_not_found") from exc
         return StandardResponse(data=record.model_dump(mode="json"))
 
+    auth_config = attach_api_key_auth(app)
+    app.state.api_auth_required = auth_config.required
+    app.state.api_auth_production = auth_config.production
     return app
 
 
