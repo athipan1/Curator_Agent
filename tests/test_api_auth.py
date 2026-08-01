@@ -2,7 +2,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import create_app
-from app.models import SkillCreateRequest
+from app.main_legacy import create_app as create_legacy_app
 from app.registry import SkillRegistry
 
 
@@ -43,6 +43,19 @@ def test_missing_key_is_rejected_with_contract_envelope(tmp_path, monkeypatch):
     assert payload["status"] == "error"
     assert payload["error"]["code"] == "missing_api_key"
     assert payload["metadata"]["required_role"] == "read"
+
+
+def test_legacy_entrypoint_enforces_same_auth_policy(tmp_path, monkeypatch):
+    _configure_auth(monkeypatch)
+    registry = SkillRegistry(str(tmp_path / "legacy-skills.sqlite3"))
+    client = TestClient(create_legacy_app(registry))
+
+    missing = client.get("/skills")
+    authorized = client.get("/skills", headers={"X-API-KEY": "read-key"})
+
+    assert missing.status_code == 401
+    assert missing.json()["error"]["code"] == "missing_api_key"
+    assert authorized.status_code == 200
 
 
 def test_read_key_cannot_mutate_skill_lifecycle(tmp_path, monkeypatch):
