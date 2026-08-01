@@ -7,6 +7,7 @@ from app.container_sandbox import ContainerSandboxExecutor, OptionalContainerExe
 from app.database_client import DatabaseAgentClient
 from app.executor import SafeSkillExecutor
 from app.performance_aware_executor import PerformanceAwareExecutor
+from app.readiness import attach_runtime_readiness
 from app.registry import SkillRegistry
 from app.schema_enforcing_executor import SchemaEnforcingExecutor
 from app.shadow_ensemble import attach_shadow_ensemble_routes
@@ -43,6 +44,11 @@ def create_app(
     )
     attach_version_lifecycle_routes(app, skill_registry)
     attach_shadow_ensemble_routes(app, skill_registry, performance_executor)
+    attach_runtime_readiness(
+        app,
+        executor=performance_executor,
+        database_client=skill_database_client,
+    )
     app.state.skill_schema_contracts_enabled = True
     app.state.confidence_calibration_enabled = True
     app.state.performance_decay_advisory_enabled = True
