@@ -46,8 +46,9 @@ def attach_runtime_readiness(
     *,
     executor: Any,
     database_client: Any,
+    seeded_backtest_skill_id: str | None = None,
 ) -> FastAPI:
-    """Replace the legacy optimistic readiness route with dependency-aware readiness."""
+    """Replace optimistic readiness while preserving existing response fields."""
 
     app.router.routes[:] = [
         route
@@ -81,10 +82,23 @@ def attach_runtime_readiness(
                 "database_telemetry_enabled": bool(database_client.enabled),
                 "database_telemetry_required": require_database_telemetry,
                 "database_telemetry_ready": database_ready,
+                "database_backtest_status_enabled": bool(database_client.enabled),
+                "seeded_backtest_skill_id": seeded_backtest_skill_id,
+                "performance_policy_endpoint": "/curate/performance-policy",
+                "skill_register_endpoint": "/skills/register",
+                "skill_list_endpoint": "/skills",
+                "skill_search_endpoint": "/skills/search",
+                "skill_recommend_endpoint": "/skills/recommend",
+                "skill_backtest_status_endpoint": "/skills/{skill_id}/backtest-status",
+                "skill_approve_from_backtest_endpoint": (
+                    "/skills/{skill_id}/approve-from-backtest"
+                ),
+                "skill_execute_endpoint": "/skills/{skill_id}/execute",
                 "blockers": blockers,
             },
             metadata={
-                "contract_source": "curator-agent-runtime-readiness",
+                "contract_source": "curator-agent-runtime-contract",
+                "readiness_contract": "curator-agent-runtime-readiness.v1",
                 "liveness_endpoint": "/health",
             },
             error=(
