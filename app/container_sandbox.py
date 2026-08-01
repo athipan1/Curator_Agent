@@ -49,15 +49,122 @@ class ContainerSandboxExecutor:
         cpu_limit: str | None = None,
         pids_limit: int | None = None,
     ) -> None:
-        self.image = image or os.getenv("CURATOR_SANDBOX_IMAGE", "curator-skill-sandbox:latest")
-        self.docker_binary = docker_binary or os.getenv("CURATOR_DOCKER_BINARY", "docker")
-        self.memory_limit = memory_limit or os.getenv("CURATOR_SANDBOX_MEMORY", "64m")
-        self.cpu_limit = cpu_limit or os.getenv("CURATOR_SANDBOX_CPUS", "0.25")
-        self.pids_limit = int(pids_limit or os.getenv("CURATOR_SANDBOX_PIDS_LIMIT", "32"))
+        self.image = image or os.getenv(
+            "CURATOR_SANDBOX_IMAGE",
+            "curator-skill-sandbox:latest",
+        )
+        self.docker_binary = docker_binary or os.getenv(
+            "CURATOR_DOCKER_BINARY",
+            "docker",
+        )
+        self.memory_limit = memory_limit or os.getenv(
+            "CURATOR_SANDBOX_MEMORY",
+            "64m",
+        )
+        self.cpu_limit = cpu_limit or os.getenv(
+            "CURATOR_SANDBOX_CPUS",
+            "0.25",
+        )
+        self.pids_limit = int(
+            pids_limit or os.getenv("CURATOR_SANDBOX_PIDS_LIMIT", "32")
+        )
 
     @property
     def available(self) -> bool:
         return shutil.which(self.docker_binary) is not None
+
+    def readiness(self, *, timeout_seconds: float = 3.0) -> Dict[str, Any]:
+        """Verify the Docker CLI, daemon, and configured immutable execution image."""
+        binary_path = shutil.which(self.docker_binary)
+        base = {
+            "mode": "container",
+            "image": self.image,
+            "docker_binary": self.docker_binary,
+            "docker_binary_path": binary_path,
+            "secure_execution_ready": False,
+        }
+        if binary_path is None:
+            return {
+                **base,
+                "ready": False,
+                "reason": "docker_binary_not_available",
+            }
+
+        try:
+            daemon = subprocess.run(
+                [self.docker_binary, "info", "--format", "{{.ServerVersion}}"],
+                capture_output=True,
+                text=True,
+                timeout=max(0.5, timeout_seconds),
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return {
+                **base,
+                "ready": False,
+                "reason": "docker_daemon_probe_timed_out",
+            }
+        except Exception as exc:
+            return {
+                **base,
+                "ready": False,
+                "reason": "docker_daemon_probe_failed",
+                "details": str(exc)[:500],
+            }
+
+        if daemon.returncode != 0:
+            return {
+                **base,
+                "ready": False,
+                "reason": "docker_daemon_unavailable",
+                "details": daemon.stderr.strip()[-500:],
+            }
+
+        try:
+            image = subprocess.run(
+                [
+                    self.docker_binary,
+                    "image",
+                    "inspect",
+                    self.image,
+                    "--format",
+                    "{{.Id}}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=max(0.5, timeout_seconds),
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return {
+                **base,
+                "ready": False,
+                "reason": "sandbox_image_probe_timed_out",
+            }
+        except Exception as exc:
+            return {
+                **base,
+                "ready": False,
+                "reason": "sandbox_image_probe_failed",
+                "details": str(exc)[:500],
+            }
+
+        if image.returncode != 0:
+            return {
+                **base,
+                "ready": False,
+                "reason": "sandbox_image_unavailable",
+                "details": image.stderr.strip()[-500:],
+            }
+
+        return {
+            **base,
+            "ready": True,
+            "reason": None,
+            "secure_execution_ready": True,
+            "docker_server_version": daemon.stdout.strip() or None,
+            "image_id": image.stdout.strip() or None,
+        }
 
     def execute(
         self,
@@ -85,7 +192,10 @@ class ContainerSandboxExecutor:
         }
         with tempfile.TemporaryDirectory(prefix="curator-sandbox-") as tmp_dir:
             input_path = Path(tmp_dir) / "input.json"
-            input_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            input_path.write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
             command = [
                 self.docker_binary,
                 "run",
@@ -189,10 +299,55 @@ class OptionalContainerExecutor:
         self.container = container
         self.fallback = fallback
         self.fallback_counter = fallback_counter or DEFAULT_SANDBOX_FALLBACK_COUNTER
-        self.enabled = os.getenv("CURATOR_CONTAINER_SANDBOX_ENABLED", "true").lower() == "true"
-        self.allow_fallback = (
-            os.getenv("CURATOR_CONTAINER_SANDBOX_FALLBACK", "false").lower() == "true"
+        self.enabled = (
+            os.getenv("CURATOR_CONTAINER_SANDBOX_ENABLED", "true").lower()
+            == "true"
         )
+        self.allow_fallback = (
+            os.getenv("CURATOR_CONTAINER_SANDBOX_FALLBACK", "false").lower()
+            == "true"
+        )
+
+    def readiness(self) -> Dict[str, Any]:
+        if not self.enabled:
+            return {
+                "ready": True,
+                "mode": "process",
+                "container_enabled": False,
+                "fallback_enabled": False,
+                "secure_execution_ready": False,
+                "degraded": True,
+                "reason": "container_sandbox_explicitly_disabled",
+                "isolation": "best_effort_not_a_true_sandbox",
+            }
+
+        probe = self.container.readiness()
+        if probe.get("ready"):
+            return {
+                **probe,
+                "fallback_enabled": self.allow_fallback,
+                "degraded": False,
+            }
+
+        if self.allow_fallback:
+            return {
+                **probe,
+                "ready": True,
+                "mode": "process_fallback",
+                "fallback_enabled": True,
+                "secure_execution_ready": False,
+                "degraded": True,
+                "container_failure_reason": probe.get("reason"),
+                "reason": "explicit_process_fallback_available",
+                "isolation": "best_effort_not_a_true_sandbox",
+            }
+
+        return {
+            **probe,
+            "ready": False,
+            "fallback_enabled": False,
+            "degraded": False,
+        }
 
     def execute(self, **kwargs: Any) -> Dict[str, Any]:
         if not self.enabled:
