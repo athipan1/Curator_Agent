@@ -11,6 +11,15 @@ from app.performance_intelligence import (
 
 
 class PerformanceAwareExecutor:
+    """Attach advisory performance intelligence without mutating validated output.
+
+    ``SchemaEnforcingExecutor`` validates the skill-defined output before this
+    decorator runs. Any mutation here could invalidate constraints such as
+    ``additionalProperties``, ``const``, ``minimum`` or ``maximum`` while leaving
+    ``schema_contract.output_valid`` incorrectly set to true. Calibration therefore
+    remains advisory metadata and the validated skill output is preserved exactly.
+    """
+
     def __init__(self, *, delegate: Any, database_client: DatabaseAgentClient) -> None:
         self.delegate = delegate
         self.database_client = database_client
@@ -44,16 +53,21 @@ class PerformanceAwareExecutor:
         calibration = calibrate_confidence(output.get("confidence"), performance)
         decay = assess_performance_decay(performance)
 
-        if calibration.get("calibrated_confidence") is not None:
-            output["raw_confidence"] = calibration["raw_confidence"]
-            output["calibrated_confidence"] = calibration["calibrated_confidence"]
-            output["confidence"] = calibration["calibrated_confidence"]
-
+        # Preserve the schema-validated output byte-for-byte at the value level.
+        # Consumers that opt into calibration can read effective_confidence from
+        # performance_intelligence without changing the skill's declared contract.
         result["output"] = output
         result["performance_intelligence"] = {
             "status": "applied" if performance else "no_history",
-            "database_status": rank_response.get("status") if isinstance(rank_response, dict) else "unknown",
+            "database_status": (
+                rank_response.get("status")
+                if isinstance(rank_response, dict)
+                else "unknown"
+            ),
             "calibration": calibration,
+            "effective_confidence": calibration.get("calibrated_confidence"),
+            "confidence_applied_to_output": False,
+            "output_schema_preserved": True,
             "decay_assessment": decay,
             "advisory_only": True,
             "auto_stage_transition": False,

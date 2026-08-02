@@ -54,9 +54,14 @@ def _client(tmp_path, monkeypatch, database):
                 "required": ["signal", "confidence", "reason"],
                 "properties": {
                     "signal": {"type": "string"},
-                    "confidence": {"type": "number"},
+                    "confidence": {
+                        "type": "number",
+                        "minimum": 0.85,
+                        "maximum": 0.95,
+                    },
                     "reason": {"type": "string"},
                 },
+                "additionalProperties": False,
             },
         )
     )
@@ -108,7 +113,10 @@ def test_decay_recommends_quarantine_for_severe_underperformance():
     assert result["auto_transition_allowed"] is False
 
 
-def test_execute_returns_calibrated_confidence_and_decay_advisory(tmp_path, monkeypatch):
+def test_execute_keeps_validated_output_immutable_and_exposes_advisory_calibration(
+    tmp_path,
+    monkeypatch,
+):
     client, skill = _client(tmp_path, monkeypatch, _DatabaseWithHistory())
 
     response = client.post(
@@ -119,10 +127,20 @@ def test_execute_returns_calibrated_confidence_and_decay_advisory(tmp_path, monk
     assert response.status_code == 200
     data = response.json()["data"]
     assert data["execution_status"] == "success"
-    assert data["output"]["raw_confidence"] == 0.9
-    assert data["output"]["calibrated_confidence"] == 0.675
-    assert data["output"]["confidence"] == 0.675
+    assert data["output"] == {
+        "signal": "buy",
+        "confidence": 0.9,
+        "reason": "momentum",
+    }
+    assert data["schema_contract"]["output_valid"] is True
+
     intelligence = data["performance_intelligence"]
+    calibration = intelligence["calibration"]
+    assert calibration["raw_confidence"] == 0.9
+    assert calibration["calibrated_confidence"] == 0.675
+    assert intelligence["effective_confidence"] == 0.675
+    assert intelligence["confidence_applied_to_output"] is False
+    assert intelligence["output_schema_preserved"] is True
     assert intelligence["status"] == "applied"
     assert intelligence["decay_assessment"]["health"] == "healthy"
     assert intelligence["auto_stage_transition"] is False
@@ -138,5 +156,14 @@ def test_execute_is_backward_compatible_without_history(tmp_path, monkeypatch):
 
     data = response.json()["data"]
     assert data["execution_status"] == "success"
-    assert data["output"]["confidence"] == 0.9
-    assert data["performance_intelligence"]["status"] == "no_history"
+    assert data["output"] == {
+        "signal": "buy",
+        "confidence": 0.9,
+        "reason": "momentum",
+    }
+    assert data["schema_contract"]["output_valid"] is True
+    intelligence = data["performance_intelligence"]
+    assert intelligence["status"] == "no_history"
+    assert intelligence["effective_confidence"] == 0.9
+    assert intelligence["confidence_applied_to_output"] is False
+    assert intelligence["output_schema_preserved"] is True
