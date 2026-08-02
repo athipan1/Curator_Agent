@@ -11,12 +11,13 @@ from app.performance_intelligence import (
 
 
 class PerformanceAwareExecutor:
-    """Attach performance intelligence without violating the skill output schema.
+    """Attach advisory performance intelligence without mutating validated output.
 
-    SchemaEnforcingExecutor validates the skill output before this decorator runs.
-    Therefore this layer may update an existing schema-approved ``confidence``
-    value, but it must never append calibration-only fields to ``output`` after
-    validation. Raw and calibrated values belong in ``performance_intelligence``.
+    ``SchemaEnforcingExecutor`` validates the skill-defined output before this
+    decorator runs. Any mutation here could invalidate constraints such as
+    ``additionalProperties``, ``const``, ``minimum`` or ``maximum`` while leaving
+    ``schema_contract.output_valid`` incorrectly set to true. Calibration therefore
+    remains advisory metadata and the validated skill output is preserved exactly.
     """
 
     def __init__(self, *, delegate: Any, database_client: DatabaseAgentClient) -> None:
@@ -52,13 +53,9 @@ class PerformanceAwareExecutor:
         calibration = calibrate_confidence(output.get("confidence"), performance)
         decay = assess_performance_decay(performance)
 
-        calibrated_confidence = calibration.get("calibrated_confidence")
-        confidence_applied = calibrated_confidence is not None and "confidence" in output
-        if confidence_applied:
-            # Updating an existing numeric field preserves the registered schema.
-            # Calibration metadata must remain outside the skill-defined output.
-            output["confidence"] = calibrated_confidence
-
+        # Preserve the schema-validated output byte-for-byte at the value level.
+        # Consumers that opt into calibration can read effective_confidence from
+        # performance_intelligence without changing the skill's declared contract.
         result["output"] = output
         result["performance_intelligence"] = {
             "status": "applied" if performance else "no_history",
@@ -68,7 +65,8 @@ class PerformanceAwareExecutor:
                 else "unknown"
             ),
             "calibration": calibration,
-            "confidence_applied_to_output": confidence_applied,
+            "effective_confidence": calibration.get("calibrated_confidence"),
+            "confidence_applied_to_output": False,
             "output_schema_preserved": True,
             "decay_assessment": decay,
             "advisory_only": True,
