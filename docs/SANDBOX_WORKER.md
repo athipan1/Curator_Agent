@@ -16,6 +16,7 @@ Curator API container
     v
 Curator Sandbox Worker
     | Docker CLI / controlled daemon
+    | host-visible shared work root
     v
 Ephemeral skill sandbox container
     - network=none
@@ -57,11 +58,25 @@ When `CURATOR_SANDBOX_WORKER_URL` is configured, the API uses `RemoteSandboxExec
 ```env
 CURATOR_SANDBOX_WORKER_API_KEY=<same worker key used by the API>
 CURATOR_SANDBOX_IMAGE=painaidee/curator-skill-sandbox:<immutable-git-sha>
+CURATOR_SANDBOX_WORK_ROOT=/var/lib/curator-worker
+CURATOR_REQUIRE_SANDBOX_WORK_ROOT=true
 CURATOR_SANDBOX_WORKER_MAX_BODY_BYTES=65536
 CURATOR_SANDBOX_WORKER_MAX_CLOCK_SKEW_SECONDS=30
 CURATOR_SANDBOX_WORKER_MAX_CONCURRENCY=2
 CURATOR_SANDBOX_WORKER_QUEUE_TIMEOUT_SECONDS=1
 ```
+
+When the worker itself runs in a container while using a host Docker socket, `CURATOR_SANDBOX_WORK_ROOT` must be bind-mounted at the identical absolute path on the host and inside the worker. The worker writes the temporary `input.json` beneath this root and the host daemon bind-mounts that same path into the ephemeral skill container.
+
+Example:
+
+```yaml
+volumes:
+  - /var/run/docker.sock:/var/run/docker.sock:ro
+  - /var/lib/curator-worker:/var/lib/curator-worker
+```
+
+Do not map different host and container paths. Docker-outside-of-Docker resolves bind sources on the daemon host, not inside the worker container. `CURATOR_REQUIRE_SANDBOX_WORK_ROOT=true` makes missing or unusable workspace configuration fail readiness and execution closed.
 
 The worker exposes only:
 
@@ -106,9 +121,11 @@ The worker image contains only the Docker CLI needed to call the controlled daem
 The `Sandbox Worker E2E` GitHub Actions workflow proves that:
 
 1. the API container has no Docker CLI or socket;
-2. API readiness depends on the signed remote worker;
-3. the worker can reach the configured sandbox image;
-4. an approved advisory skill executes in an ephemeral hardened container;
-5. network access, broker access, order placement and fallback remain disabled.
+2. the worker itself runs in a separate read-only container;
+3. the shared work root is visible at the same path to the worker and host daemon;
+4. API readiness depends on the signed remote worker;
+5. an approved advisory skill executes in an ephemeral hardened container;
+6. the temporary workspace is removed after execution;
+7. network access, broker access, order placement and fallback remain disabled.
 
 Hourly Paper Trading must keep Curator disabled until this workflow and the cross-repository Manager integration checks pass.
