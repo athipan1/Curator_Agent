@@ -13,11 +13,13 @@ from app.worker_protocol import (
 )
 
 
-def test_signature_round_trip_and_body_binding() -> None:
+def test_signature_round_trip_and_request_binding() -> None:
     secret = "w" * 48
     body = canonical_json_bytes({"skill_id": "skill-1", "inputs": {"price": 100}})
     signature = build_worker_signature(
         secret,
+        method="POST",
+        path="/v1/execute",
         timestamp="1720000000",
         nonce="nonce_value_0001",
         body=body,
@@ -26,6 +28,8 @@ def test_signature_round_trip_and_body_binding() -> None:
     assert verify_worker_signature(
         secret,
         signature,
+        method="POST",
+        path="/v1/execute",
         timestamp="1720000000",
         nonce="nonce_value_0001",
         body=body,
@@ -33,9 +37,29 @@ def test_signature_round_trip_and_body_binding() -> None:
     assert not verify_worker_signature(
         secret,
         signature,
+        method="POST",
+        path="/v1/execute",
         timestamp="1720000000",
         nonce="nonce_value_0001",
         body=body + b"x",
+    )
+    assert not verify_worker_signature(
+        secret,
+        signature,
+        method="GET",
+        path="/v1/execute",
+        timestamp="1720000000",
+        nonce="nonce_value_0001",
+        body=body,
+    )
+    assert not verify_worker_signature(
+        secret,
+        signature,
+        method="POST",
+        path="/ready",
+        timestamp="1720000000",
+        nonce="nonce_value_0001",
+        body=body,
     )
 
 
