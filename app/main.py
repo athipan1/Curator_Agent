@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from typing import Any
 
 from app.main_legacy import *  # noqa: F401,F403
 import app.main_legacy as _legacy
@@ -11,6 +12,7 @@ from app.executor import SafeSkillExecutor
 from app.performance_aware_executor import PerformanceAwareExecutor
 from app.readiness import attach_runtime_readiness
 from app.registry import SkillRegistry
+from app.remote_sandbox import RemoteSandboxExecutor
 from app.schema_enforcing_executor import SchemaEnforcingExecutor
 from app.shadow_ensemble import attach_shadow_ensemble_routes
 from app.version_api import attach_version_lifecycle_routes
@@ -40,6 +42,21 @@ def _seeded_backtest_skill_id(registry: SkillRegistry) -> str | None:
     return skill_id
 
 
+def _build_isolated_executor(base_executor: SafeSkillExecutor) -> Any:
+    worker_url = os.getenv("CURATOR_SANDBOX_WORKER_URL", "").strip()
+    worker_required = _env_bool("CURATOR_REQUIRE_SANDBOX_WORKER", False)
+    if worker_url:
+        return RemoteSandboxExecutor(worker_url=worker_url)
+    if worker_required:
+        raise RuntimeError(
+            "CURATOR_REQUIRE_SANDBOX_WORKER=true but CURATOR_SANDBOX_WORKER_URL is missing."
+        )
+    return OptionalContainerExecutor(
+        container=ContainerSandboxExecutor(),
+        fallback=base_executor,
+    )
+
+
 def create_app(
     registry: SkillRegistry | None = None,
     executor: SafeSkillExecutor | None = None,
@@ -48,10 +65,7 @@ def create_app(
     skill_registry = registry or SkillRegistry(DEFAULT_DB_PATH)
     skill_database_client = database_client or DatabaseAgentClient()
     base_executor = executor or SafeSkillExecutor()
-    isolated_executor = OptionalContainerExecutor(
-        container=ContainerSandboxExecutor(),
-        fallback=base_executor,
-    )
+    isolated_executor = _build_isolated_executor(base_executor)
     schema_executor = SchemaEnforcingExecutor(
         registry=skill_registry,
         delegate=isolated_executor,
@@ -73,12 +87,21 @@ def create_app(
         database_client=skill_database_client,
         seeded_backtest_skill_id=_seeded_backtest_skill_id(skill_registry),
     )
+    worker_enabled = isinstance(isolated_executor, RemoteSandboxExecutor)
     app.state.skill_schema_contracts_enabled = True
     app.state.confidence_calibration_enabled = True
     app.state.performance_decay_advisory_enabled = True
     app.state.champion_challenger_shadow_enabled = True
-    app.state.container_sandbox_enabled = isolated_executor.enabled
-    app.state.container_sandbox_fallback_enabled = isolated_executor.allow_fallback
+    app.state.sandbox_worker_enabled = worker_enabled
+    app.state.sandbox_worker_url = (
+        isolated_executor.worker_url if worker_enabled else None
+    )
+    app.state.container_sandbox_enabled = (
+        True if worker_enabled else isolated_executor.enabled
+    )
+    app.state.container_sandbox_fallback_enabled = (
+        False if worker_enabled else isolated_executor.allow_fallback
+    )
     return app
 
 
