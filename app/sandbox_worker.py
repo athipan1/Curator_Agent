@@ -174,6 +174,8 @@ def create_worker_app(
         if not verify_worker_signature(
             worker_key,
             signature,
+            method=request.method,
+            path=request.url.path,
             timestamp=timestamp,
             nonce=nonce,
             body=body,
