@@ -85,6 +85,17 @@ def test_remote_readiness_signs_request_and_reports_secure_worker(
     assert verify_worker_signature(
         WORKER_KEY,
         signature,
+        method="GET",
+        path="/ready",
+        timestamp=timestamp,
+        nonce=nonce,
+        body=b"",
+    )
+    assert not verify_worker_signature(
+        WORKER_KEY,
+        signature,
+        method="POST",
+        path="/v1/execute",
         timestamp=timestamp,
         nonce=nonce,
         body=b"",
