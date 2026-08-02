@@ -14,6 +14,13 @@ from typing import Any, Dict
 logger = logging.getLogger(__name__)
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 class SandboxFallbackCounter:
     """Thread-safe process-local counter for explicit isolation downgrades."""
 
@@ -48,6 +55,8 @@ class ContainerSandboxExecutor:
         memory_limit: str | None = None,
         cpu_limit: str | None = None,
         pids_limit: int | None = None,
+        work_root: str | Path | None = None,
+        require_work_root: bool | None = None,
     ) -> None:
         self.image = image or os.getenv(
             "CURATOR_SANDBOX_IMAGE",
@@ -68,21 +77,113 @@ class ContainerSandboxExecutor:
         self.pids_limit = int(
             pids_limit or os.getenv("CURATOR_SANDBOX_PIDS_LIMIT", "32")
         )
+        configured_work_root = (
+            str(work_root)
+            if work_root is not None
+            else os.getenv("CURATOR_SANDBOX_WORK_ROOT", "")
+        ).strip()
+        self.require_work_root = (
+            require_work_root
+            if require_work_root is not None
+            else _env_bool("CURATOR_REQUIRE_SANDBOX_WORK_ROOT", False)
+        )
+        if configured_work_root:
+            candidate = Path(configured_work_root).expanduser()
+            if not candidate.is_absolute():
+                raise RuntimeError("CURATOR_SANDBOX_WORK_ROOT must be an absolute path.")
+            self.work_root: Path | None = candidate.resolve(strict=False)
+        else:
+            self.work_root = None
 
     @property
     def available(self) -> bool:
         return shutil.which(self.docker_binary) is not None
 
+    def _workspace_readiness(self) -> Dict[str, Any]:
+        if self.work_root is None:
+            if self.require_work_root:
+                return {
+                    "ready": False,
+                    "configured": False,
+                    "required": True,
+                    "reason": "sandbox_work_root_not_configured",
+                }
+            return {
+                "ready": True,
+                "configured": False,
+                "required": False,
+                "reason": None,
+            }
+
+        if self.work_root.is_symlink():
+            return {
+                "ready": False,
+                "configured": True,
+                "required": self.require_work_root,
+                "reason": "sandbox_work_root_symlink_not_allowed",
+            }
+        if not self.work_root.exists():
+            return {
+                "ready": False,
+                "configured": True,
+                "required": self.require_work_root,
+                "reason": "sandbox_work_root_unavailable",
+            }
+        if not self.work_root.is_dir():
+            return {
+                "ready": False,
+                "configured": True,
+                "required": self.require_work_root,
+                "reason": "sandbox_work_root_not_directory",
+            }
+        if not os.access(self.work_root, os.W_OK | os.X_OK):
+            return {
+                "ready": False,
+                "configured": True,
+                "required": self.require_work_root,
+                "reason": "sandbox_work_root_not_writable",
+            }
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix="curator-work-root-probe-",
+                dir=self.work_root,
+            ):
+                pass
+        except Exception as exc:
+            return {
+                "ready": False,
+                "configured": True,
+                "required": self.require_work_root,
+                "reason": "sandbox_work_root_probe_failed",
+                "details": str(exc)[:500],
+            }
+        return {
+            "ready": True,
+            "configured": True,
+            "required": self.require_work_root,
+            "reason": None,
+        }
+
     def readiness(self, *, timeout_seconds: float = 3.0) -> Dict[str, Any]:
-        """Verify the Docker CLI, daemon, and configured immutable execution image."""
+        """Verify workspace, Docker CLI, daemon, and execution image."""
         binary_path = shutil.which(self.docker_binary)
+        workspace = self._workspace_readiness()
         base = {
             "mode": "container",
             "image": self.image,
             "docker_binary": self.docker_binary,
             "docker_binary_path": binary_path,
             "secure_execution_ready": False,
+            "shared_work_root_configured": workspace.get("configured", False),
+            "shared_work_root_required": workspace.get("required", False),
         }
+        if not workspace.get("ready"):
+            return {
+                **base,
+                "ready": False,
+                "reason": workspace.get("reason"),
+                "details": workspace.get("details"),
+            }
         if binary_path is None:
             return {
                 **base,
@@ -175,6 +276,15 @@ class ContainerSandboxExecutor:
         function_name: str | None = None,
         timeout_seconds: float = 1.0,
     ) -> Dict[str, Any]:
+        workspace = self._workspace_readiness()
+        if not workspace.get("ready"):
+            return {
+                "skill_id": skill_id,
+                "execution_status": "container_unavailable",
+                "error": workspace.get("reason"),
+                "output": {},
+                "sandbox": self._sandbox_metadata(),
+            }
         if not self.available:
             return {
                 "skill_id": skill_id,
@@ -190,7 +300,12 @@ class ContainerSandboxExecutor:
             "inputs": inputs,
             "function_name": function_name,
         }
-        with tempfile.TemporaryDirectory(prefix="curator-sandbox-") as tmp_dir:
+        temporary_directory_options: Dict[str, Any] = {
+            "prefix": "curator-sandbox-",
+        }
+        if self.work_root is not None:
+            temporary_directory_options["dir"] = str(self.work_root)
+        with tempfile.TemporaryDirectory(**temporary_directory_options) as tmp_dir:
             input_path = Path(tmp_dir) / "input.json"
             input_path.write_text(
                 json.dumps(payload, ensure_ascii=False),
@@ -281,6 +396,8 @@ class ContainerSandboxExecutor:
             "memory_limit": self.memory_limit,
             "cpu_limit": self.cpu_limit,
             "pids_limit": self.pids_limit,
+            "shared_work_root_configured": self.work_root is not None,
+            "shared_work_root_required": self.require_work_root,
             "broker_access": False,
             "order_placement": False,
         }
