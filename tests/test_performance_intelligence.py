@@ -54,7 +54,11 @@ def _client(tmp_path, monkeypatch, database):
                 "required": ["signal", "confidence", "reason"],
                 "properties": {
                     "signal": {"type": "string"},
-                    "confidence": {"type": "number"},
+                    "confidence": {
+                        "type": "number",
+                        "minimum": 0.85,
+                        "maximum": 0.95,
+                    },
                     "reason": {"type": "string"},
                 },
                 "additionalProperties": False,
@@ -109,7 +113,7 @@ def test_decay_recommends_quarantine_for_severe_underperformance():
     assert result["auto_transition_allowed"] is False
 
 
-def test_execute_calibrates_existing_confidence_without_adding_output_fields(
+def test_execute_keeps_validated_output_immutable_and_exposes_advisory_calibration(
     tmp_path,
     monkeypatch,
 ):
@@ -125,7 +129,7 @@ def test_execute_calibrates_existing_confidence_without_adding_output_fields(
     assert data["execution_status"] == "success"
     assert data["output"] == {
         "signal": "buy",
-        "confidence": 0.675,
+        "confidence": 0.9,
         "reason": "momentum",
     }
     assert data["schema_contract"]["output_valid"] is True
@@ -134,7 +138,8 @@ def test_execute_calibrates_existing_confidence_without_adding_output_fields(
     calibration = intelligence["calibration"]
     assert calibration["raw_confidence"] == 0.9
     assert calibration["calibrated_confidence"] == 0.675
-    assert intelligence["confidence_applied_to_output"] is True
+    assert intelligence["effective_confidence"] == 0.675
+    assert intelligence["confidence_applied_to_output"] is False
     assert intelligence["output_schema_preserved"] is True
     assert intelligence["status"] == "applied"
     assert intelligence["decay_assessment"]["health"] == "healthy"
@@ -157,5 +162,8 @@ def test_execute_is_backward_compatible_without_history(tmp_path, monkeypatch):
         "reason": "momentum",
     }
     assert data["schema_contract"]["output_valid"] is True
-    assert data["performance_intelligence"]["status"] == "no_history"
-    assert data["performance_intelligence"]["output_schema_preserved"] is True
+    intelligence = data["performance_intelligence"]
+    assert intelligence["status"] == "no_history"
+    assert intelligence["effective_confidence"] == 0.9
+    assert intelligence["confidence_applied_to_output"] is False
+    assert intelligence["output_schema_preserved"] is True
