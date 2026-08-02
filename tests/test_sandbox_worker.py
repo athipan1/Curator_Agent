@@ -64,6 +64,8 @@ def _client() -> TestClient:
 def _headers(
     body: bytes,
     *,
+    method: str = "GET",
+    path: str = "/ready",
     nonce: str = "nonce_value_00000001",
     timestamp: int | None = None,
     signature: str | None = None,
@@ -71,6 +73,8 @@ def _headers(
     resolved_timestamp = str(int(time.time()) if timestamp is None else timestamp)
     resolved_signature = signature or build_worker_signature(
         WORKER_KEY,
+        method=method,
+        path=path,
         timestamp=resolved_timestamp,
         nonce=nonce,
         body=body,
@@ -120,6 +124,16 @@ def test_worker_rejects_invalid_and_stale_signatures() -> None:
     assert stale.json()["error"]["code"] == "stale_worker_request"
 
 
+def test_worker_rejects_signature_reused_on_another_path() -> None:
+    client = _client()
+    headers = _headers(b"", nonce="nonce_value_00000006")
+
+    response = client.post("/v1/execute", content=b"", headers=headers)
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "invalid_worker_signature"
+
+
 def test_worker_rejects_replayed_nonce() -> None:
     client = _client()
     headers = _headers(b"", nonce="nonce_value_00000003")
@@ -146,7 +160,12 @@ def test_worker_executes_only_through_container_executor() -> None:
     response = client.post(
         "/v1/execute",
         content=body,
-        headers=_headers(body, nonce="nonce_value_00000004"),
+        headers=_headers(
+            body,
+            method="POST",
+            path="/v1/execute",
+            nonce="nonce_value_00000004",
+        ),
     )
 
     assert response.status_code == 200, response.text
@@ -165,7 +184,12 @@ def test_worker_rejects_oversized_request_before_execution() -> None:
     response = client.post(
         "/v1/execute",
         content=body,
-        headers=_headers(body, nonce="nonce_value_00000005"),
+        headers=_headers(
+            body,
+            method="POST",
+            path="/v1/execute",
+            nonce="nonce_value_00000005",
+        ),
     )
 
     assert response.status_code == 413
