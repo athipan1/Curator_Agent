@@ -30,12 +30,23 @@ The API and worker share only `CURATOR_SANDBOX_WORKER_API_KEY`. Every worker req
 
 ## Curator API configuration
 
+Production with TLS:
+
 ```env
-CURATOR_SANDBOX_WORKER_URL=http://curator-sandbox-worker:8020
+CURATOR_SANDBOX_WORKER_URL=https://curator-sandbox-worker.internal
 CURATOR_SANDBOX_WORKER_API_KEY=<random value with at least 32 characters>
 CURATOR_REQUIRE_SANDBOX_WORKER=true
 CURATOR_CONTAINER_SANDBOX_FALLBACK=false
 ```
+
+For an explicitly isolated private container network where TLS terminates outside the service, HTTP requires a deliberate override:
+
+```env
+CURATOR_SANDBOX_WORKER_URL=http://curator-sandbox-worker:8020
+CURATOR_ALLOW_INSECURE_WORKER_HTTP=true
+```
+
+The worker URL accepts only an absolute HTTP or HTTPS origin containing scheme, host and optional port. Embedded credentials, paths, query strings, fragments and non-HTTP schemes are rejected. Public readiness and execution responses do not reveal the internal worker URL.
 
 When `CURATOR_SANDBOX_WORKER_URL` is configured, the API uses `RemoteSandboxExecutor`. It does not attempt local Docker execution. If the worker is unavailable, execution fails closed with `rejected_remote_worker_unavailable`.
 
@@ -66,6 +77,8 @@ The Docker socket grants host-equivalent control. Do not mount it into the Curat
 
 Do not provide Alpaca, Execution_Agent, Database_Agent or other trading credentials to the worker. The worker accepts only skill code, validated inputs, function name, timeout and skill ID.
 
+The nonce replay cache is process-local. Run one worker replica unless a shared replay store or equivalent edge-level replay control is added.
+
 ## Images
 
 Build the control-plane API normally:
@@ -86,7 +99,7 @@ Build and pre-pull the immutable execution image on the worker host:
 docker build -t curator-skill-sandbox:<sha> -f sandbox/Dockerfile .
 ```
 
-The worker image contains the Docker CLI by design. The API image must not contain it.
+The worker image contains only the Docker CLI needed to call the controlled daemon. The API image must not contain the CLI or socket.
 
 ## Rollout gate
 
