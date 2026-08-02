@@ -5,6 +5,7 @@ import os
 import secrets
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Dict
 
@@ -18,6 +19,50 @@ from app.worker_protocol import (
 )
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _is_production() -> bool:
+    environment = os.getenv("APP_ENV", os.getenv("ENVIRONMENT", "development"))
+    return environment.strip().lower() in {"production", "prod"}
+
+
+def _validated_worker_url(value: str) -> str:
+    raw = value.strip().rstrip("/")
+    if not raw:
+        raise RuntimeError("CURATOR_SANDBOX_WORKER_URL must be configured.")
+    parsed = urllib.parse.urlsplit(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise RuntimeError(
+            "CURATOR_SANDBOX_WORKER_URL must use an absolute http or https URL."
+        )
+    if parsed.username or parsed.password:
+        raise RuntimeError(
+            "CURATOR_SANDBOX_WORKER_URL must not contain embedded credentials."
+        )
+    if parsed.query or parsed.fragment or parsed.path not in {"", "/"}:
+        raise RuntimeError(
+            "CURATOR_SANDBOX_WORKER_URL must contain only scheme, host and optional port."
+        )
+    if (
+        _is_production()
+        and parsed.scheme != "https"
+        and not _env_bool("CURATOR_ALLOW_INSECURE_WORKER_HTTP", False)
+    ):
+        raise RuntimeError(
+            "Production sandbox worker traffic requires HTTPS. Set "
+            "CURATOR_ALLOW_INSECURE_WORKER_HTTP=true only for an explicitly isolated "
+            "private network."
+        )
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, "", "", "")
+    )
+
+
 class RemoteSandboxExecutor:
     """Send approved skill execution to a dedicated signed sandbox worker."""
 
@@ -28,13 +73,11 @@ class RemoteSandboxExecutor:
         api_key: str | None = None,
         request_timeout_seconds: float | None = None,
     ) -> None:
-        self.worker_url = (
+        self.worker_url = _validated_worker_url(
             worker_url
             if worker_url is not None
             else os.getenv("CURATOR_SANDBOX_WORKER_URL", "")
-        ).strip().rstrip("/")
-        if not self.worker_url:
-            raise RuntimeError("CURATOR_SANDBOX_WORKER_URL must be configured.")
+        )
         self.api_key = require_worker_api_key(api_key)
         self.request_timeout_seconds = float(
             request_timeout_seconds
@@ -126,7 +169,7 @@ class RemoteSandboxExecutor:
             return {
                 "ready": False,
                 "mode": "remote_worker",
-                "worker_url": self.worker_url,
+                "worker_endpoint_configured": True,
                 "secure_execution_ready": False,
                 "degraded": False,
                 "fallback_enabled": False,
@@ -144,7 +187,7 @@ class RemoteSandboxExecutor:
         return {
             "ready": ready,
             "mode": "remote_worker",
-            "worker_url": self.worker_url,
+            "worker_endpoint_configured": True,
             "worker_status_code": status_code,
             "secure_execution_ready": ready,
             "degraded": False,
@@ -206,6 +249,5 @@ class RemoteSandboxExecutor:
                 code="invalid_sandbox_worker_response",
             )
         result["execution_backend"] = "remote_worker"
-        result["worker_url"] = self.worker_url
         result["fallback_used"] = False
         return result
