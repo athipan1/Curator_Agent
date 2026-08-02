@@ -26,14 +26,41 @@ def canonical_json_bytes(payload: dict[str, Any]) -> bytes:
     ).encode("utf-8")
 
 
+def _signature_message(
+    *,
+    method: str,
+    path: str,
+    timestamp: str,
+    nonce: str,
+    body: bytes,
+) -> bytes:
+    return b"\n".join(
+        (
+            method.upper().encode("ascii"),
+            path.encode("utf-8"),
+            timestamp.encode("ascii"),
+            nonce.encode("ascii"),
+            body,
+        )
+    )
+
+
 def build_worker_signature(
     secret: str,
     *,
+    method: str,
+    path: str,
     timestamp: str,
     nonce: str,
     body: bytes,
 ) -> str:
-    message = timestamp.encode("ascii") + b"." + nonce.encode("ascii") + b"." + body
+    message = _signature_message(
+        method=method,
+        path=path,
+        timestamp=timestamp,
+        nonce=nonce,
+        body=body,
+    )
     return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
 
 
@@ -41,6 +68,8 @@ def verify_worker_signature(
     secret: str,
     supplied_signature: str,
     *,
+    method: str,
+    path: str,
     timestamp: str,
     nonce: str,
     body: bytes,
@@ -49,6 +78,8 @@ def verify_worker_signature(
         return False
     expected = build_worker_signature(
         secret,
+        method=method,
+        path=path,
         timestamp=timestamp,
         nonce=nonce,
         body=body,
