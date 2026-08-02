@@ -1,0 +1,11 @@
+.git
+.github
+.pytest_cache
+**/__pycache__
+*.pyc
+*.pyo
+*.sqlite3
+.coverage
+htmlcov
+tests
+docs

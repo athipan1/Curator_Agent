@@ -33,6 +33,16 @@ jobs:
             painaidee/curator-agent:latest
             painaidee/curator-agent:${{ github.sha }}
 
+      - name: Build and push Curator sandbox worker
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: worker.Dockerfile
+          push: true
+          tags: |
+            painaidee/curator-sandbox-worker:latest
+            painaidee/curator-sandbox-worker:${{ github.sha }}
+
       - name: Build and push isolated skill sandbox
         uses: docker/build-push-action@v6
         with:

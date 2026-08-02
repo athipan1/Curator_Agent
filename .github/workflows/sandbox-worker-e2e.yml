@@ -1,0 +1,268 @@
+name: Sandbox Worker E2E
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "app/main.py"
+      - "app/remote_sandbox.py"
+      - "app/sandbox_worker.py"
+      - "app/worker_protocol.py"
+      - "sandbox/**"
+      - "Dockerfile"
+      - "worker.Dockerfile"
+      - ".dockerignore"
+      - "tests/test_main_remote_worker.py"
+      - "tests/test_remote_sandbox.py"
+      - "tests/test_sandbox_worker.py"
+      - "tests/test_worker_protocol.py"
+      - ".github/workflows/sandbox-worker-e2e.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "app/main.py"
+      - "app/remote_sandbox.py"
+      - "app/sandbox_worker.py"
+      - "app/worker_protocol.py"
+      - "sandbox/**"
+      - "Dockerfile"
+      - "worker.Dockerfile"
+      - ".dockerignore"
+      - ".github/workflows/sandbox-worker-e2e.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sandbox-worker-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sandbox-worker-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout Curator_Agent
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Generate ephemeral credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          worker_key="$(openssl rand -hex 32)"
+          execute_key="$(openssl rand -hex 32)"
+          admin_key="$(openssl rand -hex 32)"
+          echo "::add-mask::$worker_key"
+          echo "::add-mask::$execute_key"
+          echo "::add-mask::$admin_key"
+          echo "CURATOR_SANDBOX_WORKER_API_KEY=$worker_key" >> "$GITHUB_ENV"
+          echo "CURATOR_EXECUTE_API_KEY=$execute_key" >> "$GITHUB_ENV"
+          echo "CURATOR_ADMIN_API_KEY=$admin_key" >> "$GITHUB_ENV"
+
+      - name: Build hardened skill sandbox
+        run: docker build -t curator-skill-sandbox:worker-e2e -f sandbox/Dockerfile .
+
+      - name: Start sandbox worker on controlled Docker host
+        env:
+          CURATOR_SANDBOX_IMAGE: curator-skill-sandbox:worker-e2e
+          CURATOR_SANDBOX_WORKER_MAX_CONCURRENCY: "2"
+          CURATOR_SANDBOX_WORKER_QUEUE_TIMEOUT_SECONDS: "1"
+        run: |
+          python -m uvicorn app.sandbox_worker:app --host 0.0.0.0 --port 8020 \
+            > /tmp/curator-sandbox-worker.log 2>&1 &
+          echo $! > /tmp/curator-sandbox-worker.pid
+
+      - name: Wait for worker liveness
+        run: |
+          set -euo pipefail
+          for attempt in {1..30}; do
+            if curl -fsS http://127.0.0.1:8020/health > /tmp/worker-health.json; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/curator-sandbox-worker.log
+          exit 1
+
+      - name: Build Curator API image without Docker CLI
+        run: docker build -t curator-agent:worker-e2e -f Dockerfile .
+
+      - name: Start Curator API without Docker socket
+        run: |
+          docker run -d --name curator-api-worker-e2e \
+            --add-host=host.docker.internal:host-gateway \
+            -p 8010:8010 \
+            -e CURATOR_SANDBOX_WORKER_URL=http://host.docker.internal:8020 \
+            -e CURATOR_SANDBOX_WORKER_API_KEY="$CURATOR_SANDBOX_WORKER_API_KEY" \
+            -e CURATOR_REQUIRE_SANDBOX_WORKER=true \
+            -e CURATOR_CONTAINER_SANDBOX_ENABLED=false \
+            -e CURATOR_CONTAINER_SANDBOX_FALLBACK=false \
+            -e CURATOR_REQUIRE_API_KEY=true \
+            -e CURATOR_READ_API_KEY="$CURATOR_EXECUTE_API_KEY" \
+            -e CURATOR_EXECUTE_API_KEY="$CURATOR_EXECUTE_API_KEY" \
+            -e CURATOR_ADMIN_API_KEY="$CURATOR_ADMIN_API_KEY" \
+            -e CURATOR_REQUIRE_DATABASE_TELEMETRY=false \
+            curator-agent:worker-e2e
+
+      - name: Verify API has no Docker execution capability
+        run: |
+          set -euo pipefail
+          docker exec curator-api-worker-e2e sh -c '! command -v docker'
+          docker exec curator-api-worker-e2e sh -c 'test ! -S /var/run/docker.sock'
+
+      - name: Verify remote worker readiness
+        run: |
+          set -euo pipefail
+          for attempt in {1..40}; do
+            if curl -fsS http://127.0.0.1:8010/ready > /tmp/api-ready.json; then
+              python - <<'PY'
+          import json
+
+          with open('/tmp/api-ready.json', encoding='utf-8') as handle:
+              payload = json.load(handle)
+
+          execution = payload['data']['execution']
+          assert payload['data']['ready'] is True, payload
+          assert execution['mode'] == 'remote_worker', payload
+          assert execution['secure_execution_ready'] is True, payload
+          assert execution['fallback_enabled'] is False, payload
+          assert execution['worker_execution']['mode'] == 'container', payload
+          PY
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs curator-api-worker-e2e
+          cat /tmp/curator-sandbox-worker.log
+          exit 1
+
+      - name: Execute approved skill through remote worker
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          base = 'http://127.0.0.1:8010'
+          execute_key = os.environ['CURATOR_EXECUTE_API_KEY']
+          admin_key = os.environ['CURATOR_ADMIN_API_KEY']
+
+          def request(method, path, key, payload=None):
+              body = None
+              headers = {
+                  'X-API-KEY': key,
+                  'X-Correlation-ID': 'sandbox-worker-e2e',
+              }
+              if payload is not None:
+                  body = json.dumps(payload).encode('utf-8')
+                  headers['Content-Type'] = 'application/json'
+              req = urllib.request.Request(
+                  base + path,
+                  data=body,
+                  headers=headers,
+                  method=method,
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as response:
+                      return response.status, json.loads(response.read().decode('utf-8'))
+              except urllib.error.HTTPError as exc:
+                  return exc.code, json.loads(exc.read().decode('utf-8'))
+
+          status, registered = request(
+              'POST',
+              '/skills/register',
+              admin_key,
+              {
+                  'name': 'Remote Worker E2E Skill',
+                  'description': 'Harmless advisory skill for remote worker isolation proof.',
+                  'code': (
+                      "def signal(price):\n"
+                      "    return {'signal': 'hold', 'confidence': 0.5, "
+                      "'reason': 'remote worker verified', 'price': price}"
+                  ),
+                  'input_schema': {
+                      'type': 'object',
+                      'required': ['price'],
+                      'properties': {'price': {'type': 'number'}},
+                      'additionalProperties': False,
+                  },
+                  'output_schema': {
+                      'type': 'object',
+                      'required': ['signal', 'confidence', 'reason', 'price'],
+                      'properties': {
+                          'signal': {'type': 'string'},
+                          'confidence': {'type': 'number'},
+                          'reason': {'type': 'string'},
+                          'price': {'type': 'number'},
+                      },
+                      'additionalProperties': False,
+                  },
+              },
+          )
+          assert status == 200, registered
+          skill_id = registered['data']['skill_id']
+
+          status, approved = request(
+              'POST',
+              f'/skills/{skill_id}/approve',
+              admin_key,
+              {'approved_by': 'github-actions', 'reason': 'sandbox worker E2E'},
+          )
+          assert status == 200, approved
+
+          status, executed = request(
+              'POST',
+              f'/skills/{skill_id}/execute',
+              execute_key,
+              {
+                  'inputs': {'price': 100},
+                  'function_name': 'signal',
+                  'timeout_seconds': 2.0,
+                  'metadata': {'correlation_id': 'sandbox-worker-e2e'},
+              },
+          )
+          assert status == 200, executed
+          data = executed['data']
+          assert data['execution_status'] == 'success', executed
+          assert data['execution_backend'] == 'remote_worker', executed
+          assert data['fallback_used'] is False, executed
+          assert data['output']['signal'] == 'hold', executed
+          assert data['sandbox']['mode'] == 'container', executed
+          assert data['sandbox']['network_access'] is False, executed
+          assert data['sandbox']['read_only_filesystem'] is True, executed
+          assert data['sandbox']['broker_access'] is False, executed
+          assert data['sandbox']['order_placement'] is False, executed
+          assert data['worker']['authenticated'] is True, executed
+          PY
+
+      - name: Show diagnostics on failure
+        if: failure()
+        run: |
+          cat /tmp/worker-health.json || true
+          cat /tmp/api-ready.json || true
+          cat /tmp/curator-sandbox-worker.log || true
+          docker logs curator-api-worker-e2e || true
+          docker ps -a || true
+
+      - name: Stop runtime
+        if: always()
+        run: |
+          docker rm -f curator-api-worker-e2e || true
+          if [ -f /tmp/curator-sandbox-worker.pid ]; then
+            kill "$(cat /tmp/curator-sandbox-worker.pid)" || true
+          fi
