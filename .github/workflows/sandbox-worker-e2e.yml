@@ -6,6 +6,7 @@ on:
     branches:
       - main
     paths:
+      - "app/container_sandbox.py"
       - "app/main.py"
       - "app/remote_sandbox.py"
       - "app/sandbox_worker.py"
@@ -17,12 +18,14 @@ on:
       - "tests/test_main_remote_worker.py"
       - "tests/test_remote_sandbox.py"
       - "tests/test_sandbox_worker.py"
+      - "tests/test_sandbox_work_root.py"
       - "tests/test_worker_protocol.py"
       - ".github/workflows/sandbox-worker-e2e.yml"
   push:
     branches:
       - main
     paths:
+      - "app/container_sandbox.py"
       - "app/main.py"
       - "app/remote_sandbox.py"
       - "app/sandbox_worker.py"
@@ -44,6 +47,8 @@ jobs:
   sandbox-worker-e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      CURATOR_SHARED_WORK_ROOT: /var/lib/curator-worker-e2e
 
     steps:
       - name: Checkout Curator_Agent
@@ -73,18 +78,39 @@ jobs:
           echo "CURATOR_EXECUTE_API_KEY=$execute_key" >> "$GITHUB_ENV"
           echo "CURATOR_ADMIN_API_KEY=$admin_key" >> "$GITHUB_ENV"
 
-      - name: Build hardened skill sandbox
-        run: docker build -t curator-skill-sandbox:worker-e2e -f sandbox/Dockerfile .
-
-      - name: Start sandbox worker on controlled Docker host
-        env:
-          CURATOR_SANDBOX_IMAGE: curator-skill-sandbox:worker-e2e
-          CURATOR_SANDBOX_WORKER_MAX_CONCURRENCY: "2"
-          CURATOR_SANDBOX_WORKER_QUEUE_TIMEOUT_SECONDS: "1"
+      - name: Build runtime images
         run: |
-          python -m uvicorn app.sandbox_worker:app --host 0.0.0.0 --port 8020 \
-            > /tmp/curator-sandbox-worker.log 2>&1 &
-          echo $! > /tmp/curator-sandbox-worker.pid
+          docker build -t curator-skill-sandbox:worker-e2e -f sandbox/Dockerfile .
+          docker build -t curator-sandbox-worker:worker-e2e -f worker.Dockerfile .
+          docker build -t curator-agent:worker-e2e -f Dockerfile .
+
+      - name: Prepare host-visible worker workspace
+        run: |
+          sudo rm -rf "$CURATOR_SHARED_WORK_ROOT"
+          sudo mkdir -p "$CURATOR_SHARED_WORK_ROOT"
+          sudo chmod 0700 "$CURATOR_SHARED_WORK_ROOT"
+
+      - name: Start containerized sandbox worker
+        run: |
+          docker run -d --name curator-sandbox-worker-e2e \
+            -p 8020:8020 \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --pids-limit 128 \
+            --memory 256m \
+            --cpus 0.50 \
+            -v /var/run/docker.sock:/var/run/docker.sock:ro \
+            -v "$CURATOR_SHARED_WORK_ROOT:$CURATOR_SHARED_WORK_ROOT" \
+            -e CURATOR_SANDBOX_WORKER_API_KEY="$CURATOR_SANDBOX_WORKER_API_KEY" \
+            -e CURATOR_SANDBOX_IMAGE=curator-skill-sandbox:worker-e2e \
+            -e CURATOR_SANDBOX_WORK_ROOT="$CURATOR_SHARED_WORK_ROOT" \
+            -e CURATOR_REQUIRE_SANDBOX_WORK_ROOT=true \
+            -e CURATOR_SANDBOX_WORKER_MAX_CONCURRENCY=2 \
+            -e CURATOR_SANDBOX_WORKER_QUEUE_TIMEOUT_SECONDS=1 \
+            -e HOME=/tmp \
+            curator-sandbox-worker:worker-e2e
 
       - name: Wait for worker liveness
         run: |
@@ -95,11 +121,16 @@ jobs:
             fi
             sleep 1
           done
-          cat /tmp/curator-sandbox-worker.log
+          docker logs curator-sandbox-worker-e2e
           exit 1
 
-      - name: Build Curator API image without Docker CLI
-        run: docker build -t curator-agent:worker-e2e -f Dockerfile .
+      - name: Verify worker execution boundary
+        run: |
+          set -euo pipefail
+          docker exec curator-sandbox-worker-e2e sh -c 'command -v docker'
+          docker exec curator-sandbox-worker-e2e sh -c '! pgrep -x dockerd'
+          docker exec curator-sandbox-worker-e2e sh -c 'test -d "$CURATOR_SANDBOX_WORK_ROOT"'
+          test -d "$CURATOR_SHARED_WORK_ROOT"
 
       - name: Start Curator API without Docker socket
         run: |
@@ -136,21 +167,24 @@ jobs:
               payload = json.load(handle)
 
           execution = payload['data']['execution']
+          worker_execution = execution['worker_execution']
           assert payload['data']['ready'] is True, payload
           assert execution['mode'] == 'remote_worker', payload
           assert execution['secure_execution_ready'] is True, payload
           assert execution['fallback_enabled'] is False, payload
-          assert execution['worker_execution']['mode'] == 'container', payload
+          assert worker_execution['mode'] == 'container', payload
+          assert worker_execution['shared_work_root_configured'] is True, payload
+          assert worker_execution['shared_work_root_required'] is True, payload
           PY
               exit 0
             fi
             sleep 2
           done
           docker logs curator-api-worker-e2e
-          cat /tmp/curator-sandbox-worker.log
+          docker logs curator-sandbox-worker-e2e
           exit 1
 
-      - name: Execute approved skill through remote worker
+      - name: Execute approved skill through containerized worker
         run: |
           python - <<'PY'
           import json
@@ -188,12 +222,12 @@ jobs:
               '/skills/register',
               admin_key,
               {
-                  'name': 'Remote Worker E2E Skill',
-                  'description': 'Harmless advisory skill for remote worker isolation proof.',
+                  'name': 'Containerized Remote Worker E2E Skill',
+                  'description': 'Proves host-visible workspace execution.',
                   'code': (
                       "def signal(price):\n"
                       "    return {'signal': 'hold', 'confidence': 0.5, "
-                      "'reason': 'remote worker verified', 'price': price}"
+                      "'reason': 'containerized worker verified', 'price': price}"
                   ),
                   'input_schema': {
                       'type': 'object',
@@ -221,7 +255,7 @@ jobs:
               'POST',
               f'/skills/{skill_id}/approve',
               admin_key,
-              {'approved_by': 'github-actions', 'reason': 'sandbox worker E2E'},
+              {'approved_by': 'github-actions', 'reason': 'containerized worker E2E'},
           )
           assert status == 200, approved
 
@@ -245,24 +279,31 @@ jobs:
           assert data['sandbox']['mode'] == 'container', executed
           assert data['sandbox']['network_access'] is False, executed
           assert data['sandbox']['read_only_filesystem'] is True, executed
+          assert data['sandbox']['shared_work_root_configured'] is True, executed
+          assert data['sandbox']['shared_work_root_required'] is True, executed
           assert data['sandbox']['broker_access'] is False, executed
           assert data['sandbox']['order_placement'] is False, executed
           assert data['worker']['authenticated'] is True, executed
           PY
+
+      - name: Verify worker workspace cleanup
+        run: |
+          set -euo pipefail
+          test -z "$(sudo find "$CURATOR_SHARED_WORK_ROOT" -mindepth 1 -maxdepth 1 -print -quit)"
 
       - name: Show diagnostics on failure
         if: failure()
         run: |
           cat /tmp/worker-health.json || true
           cat /tmp/api-ready.json || true
-          cat /tmp/curator-sandbox-worker.log || true
+          docker logs curator-sandbox-worker-e2e || true
           docker logs curator-api-worker-e2e || true
+          sudo find "$CURATOR_SHARED_WORK_ROOT" -maxdepth 3 -ls || true
           docker ps -a || true
 
       - name: Stop runtime
         if: always()
         run: |
           docker rm -f curator-api-worker-e2e || true
-          if [ -f /tmp/curator-sandbox-worker.pid ]; then
-            kill "$(cat /tmp/curator-sandbox-worker.pid)" || true
-          fi
+          docker rm -f curator-sandbox-worker-e2e || true
+          sudo rm -rf "$CURATOR_SHARED_WORK_ROOT"
