@@ -59,6 +59,8 @@ class RemoteSandboxExecutor:
         nonce = secrets.token_urlsafe(24)
         signature = build_worker_signature(
             self.api_key,
+            method=method,
+            path=path,
             timestamp=timestamp,
             nonce=nonce,
             body=body,
