@@ -11,6 +11,14 @@ from app.performance_intelligence import (
 
 
 class PerformanceAwareExecutor:
+    """Attach performance intelligence without violating the skill output schema.
+
+    SchemaEnforcingExecutor validates the skill output before this decorator runs.
+    Therefore this layer may update an existing schema-approved ``confidence``
+    value, but it must never append calibration-only fields to ``output`` after
+    validation. Raw and calibrated values belong in ``performance_intelligence``.
+    """
+
     def __init__(self, *, delegate: Any, database_client: DatabaseAgentClient) -> None:
         self.delegate = delegate
         self.database_client = database_client
@@ -44,16 +52,24 @@ class PerformanceAwareExecutor:
         calibration = calibrate_confidence(output.get("confidence"), performance)
         decay = assess_performance_decay(performance)
 
-        if calibration.get("calibrated_confidence") is not None:
-            output["raw_confidence"] = calibration["raw_confidence"]
-            output["calibrated_confidence"] = calibration["calibrated_confidence"]
-            output["confidence"] = calibration["calibrated_confidence"]
+        calibrated_confidence = calibration.get("calibrated_confidence")
+        confidence_applied = calibrated_confidence is not None and "confidence" in output
+        if confidence_applied:
+            # Updating an existing numeric field preserves the registered schema.
+            # Calibration metadata must remain outside the skill-defined output.
+            output["confidence"] = calibrated_confidence
 
         result["output"] = output
         result["performance_intelligence"] = {
             "status": "applied" if performance else "no_history",
-            "database_status": rank_response.get("status") if isinstance(rank_response, dict) else "unknown",
+            "database_status": (
+                rank_response.get("status")
+                if isinstance(rank_response, dict)
+                else "unknown"
+            ),
             "calibration": calibration,
+            "confidence_applied_to_output": confidence_applied,
+            "output_schema_preserved": True,
             "decay_assessment": decay,
             "advisory_only": True,
             "auto_stage_transition": False,
