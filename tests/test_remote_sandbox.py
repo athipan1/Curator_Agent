@@ -66,7 +66,7 @@ def test_remote_readiness_signs_request_and_reports_secure_worker(
     )
     monkeypatch.setattr("app.remote_sandbox.urllib.request.urlopen", fake_urlopen)
     executor = RemoteSandboxExecutor(
-        worker_url="http://worker:8020",
+        worker_url="http://worker:8020/",
         api_key=WORKER_KEY,
         request_timeout_seconds=5,
     )
@@ -76,6 +76,8 @@ def test_remote_readiness_signs_request_and_reports_secure_worker(
     assert readiness["ready"] is True
     assert readiness["mode"] == "remote_worker"
     assert readiness["secure_execution_ready"] is True
+    assert readiness["worker_endpoint_configured"] is True
+    assert "worker_url" not in readiness
     request = captured["request"]
     headers = _lower_headers(request)
     timestamp = headers[HEADER_TIMESTAMP.lower()]
@@ -100,6 +102,40 @@ def test_remote_readiness_signs_request_and_reports_secure_worker(
         nonce=nonce,
         body=b"",
     )
+
+
+def test_remote_worker_url_rejects_unsafe_shapes() -> None:
+    unsafe_urls = (
+        "file:///tmp/worker",
+        "http://user:secret@worker:8020",
+        "http://worker:8020/internal",
+        "http://worker:8020?token=secret",
+        "worker:8020",
+    )
+
+    for worker_url in unsafe_urls:
+        with pytest.raises(RuntimeError):
+            RemoteSandboxExecutor(worker_url=worker_url, api_key=WORKER_KEY)
+
+
+def test_production_requires_https_unless_private_http_is_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.delenv("CURATOR_ALLOW_INSECURE_WORKER_HTTP", raising=False)
+
+    with pytest.raises(RuntimeError, match="requires HTTPS"):
+        RemoteSandboxExecutor(
+            worker_url="http://worker:8020",
+            api_key=WORKER_KEY,
+        )
+
+    monkeypatch.setenv("CURATOR_ALLOW_INSECURE_WORKER_HTTP", "true")
+    executor = RemoteSandboxExecutor(
+        worker_url="http://worker:8020",
+        api_key=WORKER_KEY,
+    )
+    assert executor.worker_url == "http://worker:8020"
 
 
 def test_remote_execution_returns_worker_result(
@@ -142,6 +178,7 @@ def test_remote_execution_returns_worker_result(
     assert result["execution_backend"] == "remote_worker"
     assert result["fallback_used"] is False
     assert result["sandbox"]["network_access"] is False
+    assert "worker_url" not in result
 
 
 def test_remote_execution_fails_closed_when_worker_is_unreachable(
