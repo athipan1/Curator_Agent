@@ -1,0 +1,71 @@
+name: Curator Worker Image Build
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "app/container_sandbox.py"
+      - "app/sandbox_worker.py"
+      - "app/worker_protocol.py"
+      - "requirements.txt"
+      - "worker.Dockerfile"
+      - ".dockerignore"
+      - ".github/workflows/worker-image-build.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "app/container_sandbox.py"
+      - "app/sandbox_worker.py"
+      - "app/worker_protocol.py"
+      - "requirements.txt"
+      - "worker.Dockerfile"
+      - ".dockerignore"
+      - ".github/workflows/worker-image-build.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-worker-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build worker image
+        run: docker build -t curator-sandbox-worker:ci -f worker.Dockerfile .
+
+      - name: Start worker image without Docker socket
+        run: |
+          worker_key="$(openssl rand -hex 32)"
+          echo "::add-mask::$worker_key"
+          docker run -d --name curator-sandbox-worker-build-check \
+            -p 8021:8020 \
+            -e CURATOR_SANDBOX_WORKER_API_KEY="$worker_key" \
+            -e CURATOR_SANDBOX_IMAGE=curator-skill-sandbox:not-mounted \
+            curator-sandbox-worker:ci
+
+      - name: Verify minimal worker liveness and Docker CLI
+        run: |
+          set -euo pipefail
+          for attempt in {1..30}; do
+            if curl -fsS http://127.0.0.1:8021/health > /tmp/worker-image-health.json; then
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8021/health
+          docker exec curator-sandbox-worker-build-check sh -c 'command -v docker'
+
+      - name: Show logs on failure
+        if: failure()
+        run: docker logs curator-sandbox-worker-build-check || true
+
+      - name: Stop worker image
+        if: always()
+        run: docker rm -f curator-sandbox-worker-build-check || true
