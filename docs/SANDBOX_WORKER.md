@@ -26,7 +26,7 @@ Ephemeral skill sandbox container
     - no broker credentials
 ```
 
-The API and worker share only `CURATOR_SANDBOX_WORKER_API_KEY`. Every worker request includes an HMAC-SHA256 signature, timestamp and one-time nonce. The worker rejects missing, invalid, stale and replayed requests before parsing or executing skill code.
+The API and worker share only `CURATOR_SANDBOX_WORKER_API_KEY`. Every worker request includes an HMAC-SHA256 signature, timestamp and one-time nonce. The signed message binds the HTTP method, request path, timestamp, nonce and exact request body, so a valid request cannot be moved to another endpoint or reused with another payload. The worker rejects missing, invalid, stale and replayed requests before parsing or executing skill code.
 
 ## Curator API configuration
 
